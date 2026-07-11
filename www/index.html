@@ -71,6 +71,7 @@
         <button id="stop" class="stop" disabled>Stop</button>
       </div>
       <div class="status" id="status">Waiting. Tap "Start Preview" to open the native camera.</div>
+      <pre class="status" id="debug" style="max-height:140px; overflow:auto; font-size:10px; line-height:1.3;"></pre>
     </div>
   </div>
 
@@ -89,12 +90,42 @@
     function streamer() {
       if (_streamer) return _streamer;
       const cap = window.Capacitor;
-      if (cap && typeof cap.registerPlugin === 'function') {
-        _streamer = cap.registerPlugin('Streamer');
-        return _streamer;
-      }
-      log('Capacitor bridge not available — open this in the native app, not a browser.');
+      if (!cap) { log('window.Capacitor is undefined (bridge not injected).'); return null; }
+      if (typeof cap.registerPlugin === 'function') { _streamer = cap.registerPlugin('Streamer'); return _streamer; }
+      if (cap.Plugins && cap.Plugins.Streamer) { _streamer = cap.Plugins.Streamer; return _streamer; }
+      log('Capacitor present but Streamer handle not obtainable — see debug dump.');
       return null;
+    }
+
+    // Introspect what the native bridge actually exposes on this device.
+    function diag() {
+      const cap = window.Capacitor;
+      return {
+        kind: 'poc-diag',
+        t: new Date().toISOString(),
+        hasCapacitor: !!cap,
+        capacitorKeys: cap ? Object.keys(cap) : null,
+        typeofRegisterPlugin: cap ? (typeof cap.registerPlugin) : 'no-cap',
+        platform: (cap && typeof cap.getPlatform === 'function') ? cap.getPlatform() : (cap && cap.platform) || null,
+        isNative: (cap && typeof cap.isNativePlatform === 'function') ? cap.isNativePlatform() : null,
+        hasPlugins: !!(cap && cap.Plugins),
+        pluginKeys: (cap && cap.Plugins) ? Object.keys(cap.Plugins) : null,
+        hasStreamerInPlugins: !!(cap && cap.Plugins && cap.Plugins.Streamer),
+        ua: navigator.userAgent
+      };
+    }
+    // Ship the dump to the droplet (text/plain avoids a CORS preflight; no-cors
+    // = fire-and-forget). Same sink as the main app's stream-diag telemetry.
+    function postDiag(info) {
+      try {
+        fetch('https://app.147pro.com/_api/stream-diag', {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify(info),
+          mode: 'no-cors',
+          keepalive: true
+        }).catch(function(){});
+      } catch (e) {}
     }
 
     function parseRes() { const [w, h] = $('res').value.split('x').map(Number); return { width: w, height: h }; }
@@ -138,9 +169,12 @@
 
     // Surface native status events (fps, bitrate, connection, errors) if the plugin emits them.
     document.addEventListener('DOMContentLoaded', () => {
+      const info = diag();
+      document.getElementById('debug').textContent = JSON.stringify(info, null, 1);
+      postDiag(info);
       const s = streamer();
       if (s && s.addListener) {
-        s.addListener('status', (data) => { log(JSON.stringify(data)); });
+        try { s.addListener('status', (data) => { log(JSON.stringify(data)); }); } catch (e) {}
       }
     });
   </script>
