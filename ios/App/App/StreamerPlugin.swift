@@ -25,13 +25,18 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "stopStream", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setLens", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setOverlay", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "updateOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise)
     ]
 
-    // Scoreboard overlay, composited on the HaishinKit screen (appears in both the
+    // Scoreboard overlays composited on the HaishinKit screen (appear in both the
     // native preview and the encoded stream). @ScreenActor-isolated.
+    // - scoreboard: legacy plain-text placeholder.
+    // - overlayImage: the REAL path — a full-frame transparent PNG rendered by the
+    //   web control page (a broadcast Pro-TV scoreboard), composited 1:1.
     @ScreenActor private var scoreboard: TextScreenObject?
+    @ScreenActor private var overlayImage: ImageScreenObject?
 
     private let mixer = MediaMixer(
         multiCamSessionEnabled: false,
@@ -172,6 +177,43 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             self.reportDiag("overlay.set", ["text": text])
             call.resolve()
         }
+    }
+
+    /// Composite a full-frame transparent overlay bitmap (the real broadcast
+    /// scoreboard rendered by the web control page) onto the stream. This is the
+    /// production bitmap-bridge: web draws pixels → native composites them, so ALL
+    /// overlays (any Pro-TV board, pool board, sponsors, watermark) reuse one path.
+    @objc func updateOverlay(_ call: CAPPluginCall) {
+        let img = call.getString("image") ?? ""
+        Task {
+            let ok = await self.applyOverlayImage(img)
+            self.reportDiag("overlay.image", ["ok": ok, "bytes": img.count])
+            call.resolve(["ok": ok])
+        }
+    }
+
+    @ScreenActor
+    private func applyOverlayImage(_ b64: String) -> Bool {
+        // Accept a raw base64 or a data: URL.
+        let parts = b64.components(separatedBy: ",")
+        let raw = parts.count > 1 ? parts[parts.count - 1] : b64
+        guard let data = Data(base64Encoded: raw, options: .ignoreUnknownCharacters),
+              let image = UIImage(data: data),
+              let cg = image.cgImage else { return false }
+        if overlayImage == nil {
+            let obj = ImageScreenObject()
+            obj.horizontalAlignment = .left   // full-frame image, top-left, drawn 1:1
+            obj.verticalAlignment = .top
+            try? mixer.screen.addChild(obj)
+            overlayImage = obj
+            // Drop the plain-text placeholder once the real board is in.
+            if let sb = scoreboard {
+                mixer.screen.removeChild(sb)
+                scoreboard = nil
+            }
+        }
+        overlayImage?.cgImage = cg
+        return true
     }
 
     @ScreenActor
@@ -318,7 +360,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
 
         try await attachPreviewIfNeeded()
-        await updateScoreboard("0 - 0")
+        // No placeholder text — the real broadcast board arrives via updateOverlay
+        // (rendered by the web control page) on the first poll.
     }
 
     private func attachPreviewIfNeeded() async throws {

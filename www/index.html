@@ -270,9 +270,13 @@
         const j = await r.json();
         if (j && typeof j.seq === 'number' && j.seq !== lastRemoteSeq) {
           lastRemoteSeq = j.seq;
-          if (j.text != null) {
-            const s = streamer();
-            if (s && s.setOverlay) { try { await s.setOverlay({ text: j.text }); } catch (e) {} }
+          const s = streamer();
+          if (!s) return;
+          // Prefer the rendered broadcast board (image); fall back to text.
+          if (j.image && s.updateOverlay) {
+            try { await s.updateOverlay({ image: j.image }); } catch (e) {}
+          } else if (j.text != null && s.setOverlay) {
+            try { await s.setOverlay({ text: j.text }); } catch (e) {}
           }
         }
       } catch (e) {}
