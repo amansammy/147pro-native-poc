@@ -16,8 +16,10 @@ end
 
 target 'App' do
   capacitor_pods
-  # Native streaming (true 1080p60 → RTMP) for the PoC:
-  pod 'HaishinKit', '~> 2.0'
+  # Native streaming (true 1080p60 → RTMP) for the PoC. Pinned to 2.0.9 — the
+  # latest on CocoaPods trunk (2.1/2.2 are SPM-only). Plugin is written against
+  # this exact version's API.
+  pod 'HaishinKit', '2.0.9'
 end
 
 post_install do |installer|
