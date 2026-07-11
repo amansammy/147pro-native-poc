@@ -79,9 +79,10 @@ workflows:
           xcode-project use-profiles
       - name: Set build number
         script: |
-          cd ios/App
-          LATEST=$(app-store-connect get-latest-testflight-build-number "$BUNDLE_ID" 2>/dev/null || echo 0)
-          agvtool new-version -all $(($LATEST + 1))
+          # Epoch seconds as CFBundleVersion — always unique and increasing, so
+          # every upload is accepted. PlistBuddy sets it directly on the Info.plist
+          # (the earlier agvtool/get-latest approach left it at "1" → duplicate).
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(date +%s)" ios/App/App/Info.plist
       - name: Build IPA
         script: |
           xcode-project build-ipa \
