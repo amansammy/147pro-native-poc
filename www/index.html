@@ -82,6 +82,7 @@
         <div class="row">
           <div><label>Resolution</label>
             <select id="res">
+              <option value="3840x2160">4K</option>
               <option value="1920x1080" selected>1080p</option>
               <option value="1280x720">720p</option>
             </select>
@@ -153,6 +154,14 @@
     }
 
     function parseRes() { const [w, h] = $('res').value.split('x').map(Number); return { width: w, height: h }; }
+
+    // Auto-suggest a sensible bitrate per resolution (YouTube recommendations).
+    // 4K60 is very demanding — expect heat; this is the "how far can native go" test.
+    const RECOMMENDED_KBPS = { '3840x2160': 45000, '1920x1080': 12000, '1280x720': 6000 };
+    $('res').onchange = () => {
+      const rec = RECOMMENDED_KBPS[$('res').value];
+      if (rec) $('bitrate').value = rec;
+    };
 
     // Collapse/expand so the panel never buries the camera preview (landscape fix).
     $('toggle').onclick = () => {
@@ -232,8 +241,9 @@
         try {
           s.addListener('status', (d) => {
             if (d && d.event === 'media.tick') {
-              tickEl.textContent = 'fps ' + d.fps + ' · ' + Math.round((d.bytesPerSec||0)/1024) + ' KB/s · ' +
-                (d.byteCount||0) + ' B total · ' + d.readyState + (d.connected ? ' · connected' : '');
+              tickEl.textContent = 'fps ' + d.fps + ' · ' + Math.round((d.bytesPerSec||0)/1024) + ' KB/s (~' +
+                Math.round((d.bytesPerSec||0)*8/1e6) + ' Mbps) · ' + d.readyState +
+                (d.thermal ? ' · thermal: ' + d.thermal : '') + (d.connected ? ' · connected' : '');
             } else if (d && d.event) {
               log(d.event + (d.error ? ': ' + d.error : (d.code ? ': ' + d.code : '')));
             }

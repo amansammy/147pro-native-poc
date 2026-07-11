@@ -206,6 +206,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         // an audio track); camera is prompted by attachVideo.
         _ = await AVCaptureDevice.requestAccess(for: .audio)
 
+        // Set the capture session preset to MATCH the target resolution, so we
+        // capture at true native res instead of the default preset (which would be
+        // upscaled into the screen canvas). This is also what unlocks true 4K.
+        let preset = sessionPreset(for: width, height: height)
+        await mixer.setSessionPreset(preset)
+        reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
+
         // Camera + mic.
         let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
         do {
@@ -298,6 +305,25 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         mixer.screen.size = size
     }
 
+    private func sessionPreset(for width: Int, height: Int) -> AVCaptureSession.Preset {
+        switch (width, height) {
+        case (3840, 2160): return .hd4K3840x2160
+        case (1920, 1080): return .hd1920x1080
+        case (1280, 720): return .hd1280x720
+        default: return .high
+        }
+    }
+
+    private func thermalStateString() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
+    }
+
     private func cameraDevice(for lens: String) -> AVCaptureDevice? {
         switch lens {
         case "ultrawide":
@@ -345,7 +371,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                     "readyState": "\(ready)",
                     "connected": connected,
                     "byteCount": info.byteCount,
-                    "bytesPerSec": info.currentBytesPerSecond
+                    "bytesPerSec": info.currentBytesPerSecond,
+                    "thermal": self.thermalStateString()
                 ])
             }
         }
