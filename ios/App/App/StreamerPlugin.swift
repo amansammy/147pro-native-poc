@@ -7,19 +7,14 @@ import UIKit
 
 /// Native streaming plugin for the 147 Pro PoC.
 ///
-/// Proves the core hypothesis: capture the camera at **true 1080p60** via
-/// AVFoundation (which the WebKit `getUserMedia` sandbox can't expose), hardware
-/// H.264 encode, and push **RTMP directly to YouTube** — no MediaMTX, no WebRTC
-/// ceilings.
+/// Captures the camera at true native resolution via AVFoundation (which the
+/// WebKit `getUserMedia` sandbox can't expose), hardware H.264 encodes, and
+/// pushes RTMP directly to YouTube — no MediaMTX, no WebRTC ceilings.
 ///
-/// Written against **HaishinKit 2.0.9** (the latest on CocoaPods trunk; 2.1/2.2
-/// are SPM-only). API verified from HaishinKit's own 2.0.9 sources.
-///
-/// This build is DIAGNOSTIC-HEAVY: every stage of go-live (attach, connect,
-/// publish) plus a live media-flow tick (fps / bytes / readyState) and both RTMP
-/// status streams are shipped to the droplet (`/_api/stream-diag`) AND emitted to
-/// the JS `status` listener, so we can see exactly why YouTube shows "no data"
-/// even though publish resolves.
+/// Written against **HaishinKit 2.0.9** (latest on CocoaPods trunk). Confirmed
+/// working: true 1080p60 → YouTube with a live overlay. This build adds
+/// thermal-adaptive bitrate, auto-reconnect, zoom, focus/exposure lock, and a
+/// clean stop/start teardown.
 @objc(StreamerPlugin)
 public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "StreamerPlugin"
@@ -29,14 +24,15 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "startStream", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopStream", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setLens", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "setOverlay", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "setOverlay", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise)
     ]
 
-    // Scoreboard overlay, composited on the HaishinKit screen (so it appears in
-    // both the native preview and the encoded stream). @ScreenActor-isolated.
+    // Scoreboard overlay, composited on the HaishinKit screen (appears in both the
+    // native preview and the encoded stream). @ScreenActor-isolated.
     @ScreenActor private var scoreboard: TextScreenObject?
 
-    // Single back camera, auto-managed capture session.
     private let mixer = MediaMixer(
         multiCamSessionEnabled: false,
         multiTrackAudioMixingEnabled: false,
@@ -45,9 +41,20 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var connection: RTMPConnection?
     private var stream: RTMPStream?
     private var previewView: MTHKView?
-    private var isPreviewing = false
     private var currentLens = "wide"
+    private var currentDevice: AVCaptureDevice?
     private var observersStarted = false
+
+    // Stream params retained for auto-reconnect + thermal-adaptive bitrate.
+    private var streamURL: String?
+    private var streamKey: String?
+    private var streamW = 1920
+    private var streamH = 1080
+    private var streamFps: Double = 60
+    private var targetBitrate = 12_000_000
+    private var appliedBitrate = 0
+    private var userStopped = false
+    private var reconnecting = false
 
     // MARK: - JS API
 
@@ -77,51 +84,17 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         let width = call.getInt("width") ?? 1920
         let height = call.getInt("height") ?? 1080
         let fps = Double(call.getInt("fps") ?? 60)
-        let bitrate = call.getInt("bitrate") ?? 9_000_000
+        let bitrate = call.getInt("bitrate") ?? 12_000_000
+        // Retain for reconnect + thermal adaptation.
+        self.streamURL = url
+        self.streamKey = streamKey
+        self.streamW = width; self.streamH = height; self.streamFps = fps
+        self.targetBitrate = bitrate; self.appliedBitrate = bitrate
+        self.userStopped = false
         Task {
             do {
                 try await self.setupPipeline(width: width, height: height, fps: fps)
-                guard let connection = self.connection, let stream = self.stream else {
-                    call.reject("pipeline not ready")
-                    return
-                }
-
-                // Report camera/mic authorization — a denied mic is a common cause
-                // of YouTube showing "no data" (it wants an audio track).
-                self.reportDiag("perms", [
-                    "camera": "\(AVCaptureDevice.authorizationStatus(for: .video).rawValue)",
-                    "mic": "\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)"
-                ])
-
-                // Encoder settings — native encode, so we set the bitrate directly
-                // (no WebRTC GCC ramp) at true 1080p60.
-                var videoSettings = await stream.videoSettings
-                videoSettings.videoSize = CGSize(width: width, height: height)
-                videoSettings.bitRate = bitrate
-                // THE fps-0 FIX. VideoCodecSettings defaults profileLevel to
-                // kVTProfileLevel_H264_Baseline_3_1 — but H.264 Level 3.1 tops out at
-                // 1280x720. Feeding a 1920x1080 frame to a Baseline-3.1 VTCompression
-                // session makes VideoToolbox produce ZERO output (currentFPS 0) while
-                // audio still flows, so YouTube saw no video and dropped us. High +
-                // AutoLevel lets VideoToolbox pick Level 4.2 (needed for 1080p60) and
-                // is also the High profile we want for quality.
-                videoSettings.profileLevel = kVTProfileLevel_H264_High_AutoLevel as String
-                await stream.setVideoSettings(videoSettings)
-                self.reportDiag("videoSettings.applied", ["w": width, "h": height, "bitRate": bitrate, "profile": "H264_High_AutoLevel"])
-
-                // Begin draining status + media-flow BEFORE connect so we capture
-                // the RTMP handshake codes.
-                self.startObservers()
-
-                // YouTube: connect to the app URL (…/live2), publish with the key.
-                self.reportDiag("connect.attempt", ["url": url])
-                _ = try await connection.connect(url)
-                self.reportDiag("connect.ok", ["connected": await connection.connected])
-
-                self.reportDiag("publish.attempt", ["keyPrefix": String(streamKey.prefix(4)) + "…"])
-                _ = try await stream.publish(streamKey)
-                self.reportDiag("publish.ok", ["readyState": "\(await stream.readyState)"])
-
+                try await self.goLive()
                 self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
                 call.resolve()
             } catch {
@@ -131,22 +104,67 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Apply encoder settings, start observers, connect + publish. Reused by both
+    /// startStream and auto-reconnect.
+    private func goLive() async throws {
+        guard let connection = self.connection, let stream = self.stream,
+              let url = self.streamURL, let key = self.streamKey else {
+            throw NSError(domain: "Streamer", code: 1, userInfo: [NSLocalizedDescriptionKey: "pipeline not ready"])
+        }
+        self.reportDiag("perms", [
+            "camera": "\(AVCaptureDevice.authorizationStatus(for: .video).rawValue)",
+            "mic": "\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)"
+        ])
+        var videoSettings = await stream.videoSettings
+        videoSettings.videoSize = CGSize(width: streamW, height: streamH)
+        videoSettings.bitRate = targetBitrate
+        // High + AutoLevel: Baseline 3.1 (the default) caps at 720p and emits ZERO
+        // frames at 1080p; High/AutoLevel lets VideoToolbox pick the level 1080p60
+        // needs and is the quality tier we want.
+        videoSettings.profileLevel = kVTProfileLevel_H264_High_AutoLevel as String
+        await stream.setVideoSettings(videoSettings)
+        self.appliedBitrate = targetBitrate
+        self.reportDiag("videoSettings.applied", ["w": streamW, "h": streamH, "bitRate": targetBitrate, "profile": "H264_High_AutoLevel"])
+
+        self.startObservers()
+
+        self.reportDiag("connect.attempt", ["url": url])
+        _ = try await connection.connect(url)
+        self.reportDiag("connect.ok", ["connected": await connection.connected])
+
+        self.reportDiag("publish.attempt", ["keyPrefix": String(key.prefix(4)) + "…"])
+        _ = try await stream.publish(key)
+        self.reportDiag("publish.ok", ["readyState": "\(await stream.readyState)"])
+    }
+
     @objc func stopStream(_ call: CAPPluginCall) {
         Task {
-            if let stream = self.stream {
-                _ = try? await stream.close()
-            }
-            if let connection = self.connection {
-                _ = try? await connection.close()
-            }
+            self.userStopped = true
+            await self.teardownStreamObjects()
             self.emit(["state": "idle"])
             call.resolve()
         }
     }
 
-    /// Update the scoreboard overlay text. Proves web-driven overlays composite
-    /// into the native 1080p60 stream — the core feature. In the real app this
-    /// text is replaced by an ImageScreenObject fed the web scoreboard bitmap.
+    /// Close + release the RTMP objects so the next start is FRESH. Reusing a
+    /// closed RTMPConnection/RTMPStream (the old behaviour) produced a zombie
+    /// "publishing" stream with 0 fps / 0 KB/s. The mixer, camera, preview, and
+    /// overlay stay alive.
+    private func teardownStreamObjects() async {
+        if let stream = self.stream {
+            _ = try? await stream.close()
+            await mixer.removeOutput(stream)
+        }
+        if let connection = self.connection {
+            _ = try? await connection.close()
+        }
+        self.connection = nil
+        self.stream = nil
+        self.observersStarted = false
+    }
+
+    // MARK: - Overlay
+
     @objc func setOverlay(_ call: CAPPluginCall) {
         let text = call.getString("text") ?? ""
         Task {
@@ -175,9 +193,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         scoreboard?.string = text
     }
 
-    /// Live camera-lens switch. iPhone back lenses: "wide" (1x), "ultrawide"
-    /// (0.5x), "tele" (3x); plus "front". Needed because the user's wide lens is
-    /// physically damaged.
+    // MARK: - Camera controls
+
+    /// Live camera-lens switch. Back lenses: "wide" (1x), "ultrawide" (0.5x),
+    /// "tele" (3x); plus "front". These ARE the optical lenses (true optical steps).
     @objc func setLens(_ call: CAPPluginCall) {
         let lens = call.getString("lens") ?? "wide"
         Task {
@@ -189,6 +208,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             do {
                 try await self.mixer.attachVideo(device, track: 0)
                 self.currentLens = lens
+                self.currentDevice = device
                 self.reportDiag("lens.set", ["lens": lens, "device": device.localizedName])
                 self.emit(["state": "lens", "lens": lens])
                 call.resolve(["lens": lens])
@@ -199,22 +219,67 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Zoom the current lens. factor 1.0 = the lens's native field of view; higher
+    /// crops in (digital past the optical range). Combine with setLens for the
+    /// optical steps.
+    @objc func setZoom(_ call: CAPPluginCall) {
+        let factor = call.getDouble("factor") ?? 1.0
+        guard let device = self.currentDevice else {
+            call.reject("no active camera")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            let maxZoom = min(device.maxAvailableVideoZoomFactor, 10.0)
+            let clamped = max(1.0, min(CGFloat(factor), maxZoom))
+            device.videoZoomFactor = clamped
+            device.unlockForConfiguration()
+            self.reportDiag("zoom.set", ["factor": Double(clamped)])
+            call.resolve(["factor": Double(clamped)])
+        } catch {
+            self.reportDiag("zoom.error", ["error": error.localizedDescription])
+            call.reject("zoom failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Lock (or restore auto) focus + exposure — useful for a fixed table shot so
+    /// the camera doesn't hunt when players move.
+    @objc func setFocusExposureLock(_ call: CAPPluginCall) {
+        let locked = call.getBool("locked") ?? true
+        guard let device = self.currentDevice else {
+            call.reject("no active camera")
+            return
+        }
+        do {
+            try device.lockForConfiguration()
+            if locked {
+                if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+                if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+            } else {
+                if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+            }
+            device.unlockForConfiguration()
+            self.reportDiag("focusExposure.set", ["locked": locked])
+            call.resolve(["locked": locked])
+        } catch {
+            self.reportDiag("focusExposure.error", ["error": error.localizedDescription])
+            call.reject("focus/exposure lock failed: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
-        // Proactively request mic access so audio actually attaches (YouTube wants
-        // an audio track); camera is prompted by attachVideo.
         _ = await AVCaptureDevice.requestAccess(for: .audio)
 
-        // Set the capture session preset to MATCH the target resolution, so we
-        // capture at true native res instead of the default preset (which would be
-        // upscaled into the screen canvas). This is also what unlocks true 4K.
+        // Capture at true native res (default preset is 720p → upscaled).
         let preset = sessionPreset(for: width, height: height)
         await mixer.setSessionPreset(preset)
         reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
 
-        // Camera + mic.
         let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        self.currentDevice = camera
         do {
             try await mixer.attachVideo(camera, track: 0)
             reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
@@ -232,47 +297,28 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             reportDiag("attachAudio.noDevice", [:])
         }
 
-        // Landscape capture. This is THE fix for fps 0: the phone captures portrait
-        // by default, so a portrait buffer (e.g. 1080x1920) was hitting an encoder
-        // configured for 1920x1080 landscape — a size mismatch the H.264 encoder
-        // silently rejects, so ZERO video frames were produced while audio flowed.
-        // Forcing landscape makes the capture buffers 1920x1080, matching the
-        // encoder + screen size. It also fixes the "stays portrait in landscape"
-        // preview. (A snooker/pool stream is landscape anyway.)
+        // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
         await mixer.setVideoOrientation(.landscapeRight)
-        reportDiag("videoOrientation.set", ["orientation": "landscapeRight"])
-
-        // Output/composition size + capture frame rate. setFrameRate drives the
-        // device toward a 60fps-capable format — the whole point of going native.
         await mixer.setFrameRate(fps)
-        // screen.size is @ScreenActor-isolated, so mutate it on that actor.
         await setScreenSize(CGSize(width: width, height: height))
 
-        // Create the RTMP stream up front so the preview can render through it,
-        // even before we connect/publish.
+        // Create the RTMP objects if not already present (kept across preview→live;
+        // recreated fresh after a stop).
         if connection == nil {
             let connection = RTMPConnection()
             let stream = RTMPStream(connection: connection)
-            await mixer.addOutput(stream)       // capture → encoder/stream
+            await mixer.addOutput(stream)
             self.connection = connection
             self.stream = stream
         }
 
-        // THE fps-0 FIX. MediaMixer defaults to VideoMixerSettings.mode == .passthrough.
-        // In passthrough the offscreen screen-compositor loop is stopped, and raw
-        // camera frames are only delivered to outputs whose videoTrackId == the
-        // capture track (0). But RTMPStream.videoTrackId defaults to UInt8.max, so it
-        // was NEVER receiving video — currentFPS 0 while audio (which has no such
-        // gate) flowed. Switching to .offscreen starts the screen display-link
-        // compositor, which renders the camera (track 0) into the 1920x1080 screen
-        // canvas and delivers it to UInt8.max outputs (our RTMPStream) → real video.
-        // This is also the mode the scoreboard overlay will need (mixer.screen).
+        // .offscreen runs the screen compositor so camera + overlay reach the encoder
+        // (in .passthrough the RTMPStream, videoTrackId == .max, gets no video).
         await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
         reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
 
         try await attachPreviewIfNeeded()
         await updateScoreboard("0 - 0")
-        isPreviewing = true
     }
 
     private func attachPreviewIfNeeded() async throws {
@@ -280,11 +326,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             await MainActor.run {
                 guard let container = self.bridge?.viewController?.view else { return }
                 let view = MTHKView(frame: container.bounds)
-                // .resizeAspect = show the true 16:9 landscape frame (WYSIWYG of
-                // what's streamed), rather than cropping to fill.
                 view.videoGravity = .resizeAspect
                 view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-                // Behind the (transparent) Capacitor WebView so web UI floats on top.
                 container.insertSubview(view, at: 0)
                 self.previewView = view
                 if let webView = self.bridge?.webView {
@@ -295,11 +338,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
         if let view = previewView, let stream = self.stream {
-            await stream.addOutput(view)         // stream → preview
+            await stream.addOutput(view)
         }
     }
 
-    // Mutations of the HaishinKit compositor screen must happen on @ScreenActor.
     @ScreenActor
     private func setScreenSize(_ size: CGSize) {
         mixer.screen.size = size
@@ -324,6 +366,15 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Thermal-adaptive target: throttle when hot, RESTORE to full when it cools.
+    private func bitrateForThermal() -> Int {
+        switch ProcessInfo.processInfo.thermalState {
+        case .serious: return Int(Double(targetBitrate) * 0.6)
+        case .critical: return Int(Double(targetBitrate) * 0.4)
+        default: return targetBitrate   // nominal / fair → full quality
+        }
+    }
+
     private func cameraDevice(for lens: String) -> AVCaptureDevice? {
         switch lens {
         case "ultrawide":
@@ -337,10 +388,53 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    // MARK: - Diagnostics
+    // MARK: - Reconnect
 
-    /// Drain both RTMP status streams and poll media-flow so we can see whether
-    /// bytes/frames are actually leaving the device after publish resolves.
+    /// Fired when the RTMP connection drops unexpectedly (not a user Stop).
+    private func handleUnexpectedClose() async {
+        guard !userStopped, !reconnecting else { return }
+        reconnecting = true
+        reportDiag("reconnect.begin", [:])
+        var attempt = 0
+        while !userStopped && attempt < 30 {
+            attempt += 1
+            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3s backoff
+            if userStopped { break }
+            do {
+                await rebuildStreamObjects()
+                try await goLive()
+                reportDiag("reconnect.ok", ["attempt": attempt])
+                emit(["state": "live", "reconnected": true])
+                break
+            } catch {
+                reportDiag("reconnect.retry", ["attempt": attempt, "error": error.localizedDescription])
+            }
+        }
+        reconnecting = false
+    }
+
+    /// Recreate just the RTMP connection/stream (keep camera/mixer/preview/overlay).
+    private func rebuildStreamObjects() async {
+        if let stream = self.stream {
+            _ = try? await stream.close()
+            await mixer.removeOutput(stream)
+        }
+        if let connection = self.connection {
+            _ = try? await connection.close()
+        }
+        let c = RTMPConnection()
+        let s = RTMPStream(connection: c)
+        await mixer.addOutput(s)
+        self.connection = c
+        self.stream = s
+        self.observersStarted = false
+        if let view = self.previewView {
+            await s.addOutput(view)
+        }
+    }
+
+    // MARK: - Observers / diagnostics
+
     private func startObservers() {
         guard !observersStarted, let connection = self.connection, let stream = self.stream else { return }
         observersStarted = true
@@ -349,6 +443,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             let statusStream = await connection.status
             for await s in statusStream {
                 self?.reportDiag("rtmp.connection.status", ["code": "\(s.code)", "level": "\(s.level)"])
+                if "\(s.code)" == "NetConnection.Connect.Closed" {
+                    Task { await self?.handleUnexpectedClose() }
+                }
             }
         }
         Task { [weak self] in
@@ -357,23 +454,39 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 self?.reportDiag("rtmp.stream.status", ["code": "\(s.code)", "level": "\(s.level)"])
             }
         }
-        // Media-flow ticks: fps>0 and bytesPerSec>0 => media IS reaching YouTube.
+        // Media-flow tick: runs until the connection drops. Also applies
+        // thermal-adaptive bitrate (throttle when hot, restore when cool).
+        let tickStream = stream
         Task { [weak self] in
-            for _ in 0..<30 {
+            while true {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, let stream = self.stream, let connection = self.connection else { break }
+                // Stop if a reconnect swapped in a new stream (avoid duplicate ticks).
+                guard stream === tickStream else { break }
+                let connected = await connection.connected
                 let fps = await stream.currentFPS
                 let ready = await stream.readyState
-                let connected = await connection.connected
                 let info = await stream.info
+
+                let desired = self.bitrateForThermal()
+                if desired != self.appliedBitrate {
+                    var vs = await stream.videoSettings
+                    vs.bitRate = desired
+                    await stream.setVideoSettings(vs)   // live, no encoder rebuild
+                    self.appliedBitrate = desired
+                    self.reportDiag("bitrate.adapt", ["bitRate": desired, "thermal": self.thermalStateString()])
+                }
+
                 self.reportDiag("media.tick", [
                     "fps": Int(fps),
                     "readyState": "\(ready)",
                     "connected": connected,
                     "byteCount": info.byteCount,
                     "bytesPerSec": info.currentBytesPerSecond,
-                    "thermal": self.thermalStateString()
+                    "thermal": self.thermalStateString(),
+                    "bitRate": self.appliedBitrate
                 ])
+                if !connected { break }
             }
         }
     }

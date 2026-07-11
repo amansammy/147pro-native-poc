@@ -79,6 +79,13 @@
           <button class="lens" data-lens="tele">Tele 3×</button>
           <button class="lens" data-lens="front">Front</button>
         </div>
+        <div class="lens-row">
+          <button class="lens" id="lockAE">🔒 Lock focus/exp</button>
+          <div style="flex:2; display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; opacity:0.7; white-space:nowrap;">Zoom <span id="zoomVal">1.0×</span></span>
+            <input id="zoom" type="range" min="1" max="5" step="0.1" value="1" style="flex:1;" />
+          </div>
+        </div>
         <div class="row">
           <div><label>Resolution</label>
             <select id="res">
@@ -194,6 +201,24 @@
     $('homeUp').onclick = () => { scoreA++; pushScore(); };
     $('awayUp').onclick = () => { scoreB++; pushScore(); };
     $('scoreReset').onclick = () => { scoreA = 0; scoreB = 0; pushScore(); };
+
+    // Focus/exposure lock — fixed table shot won't hunt when players move.
+    let aeLocked = false;
+    $('lockAE').onclick = async () => {
+      const s = streamer(); if (!s || !s.setFocusExposureLock) return;
+      aeLocked = !aeLocked;
+      $('lockAE').classList.toggle('active', aeLocked);
+      $('lockAE').textContent = aeLocked ? '🔓 Unlock focus/exp' : '🔒 Lock focus/exp';
+      try { await s.setFocusExposureLock({ locked: aeLocked }); }
+      catch (e) { log('lockAE: ' + (e && e.message ? e.message : e)); }
+    };
+    // Zoom (digital, on top of the optical lens picked above).
+    $('zoom').oninput = async () => {
+      const f = parseFloat($('zoom').value);
+      $('zoomVal').textContent = f.toFixed(1) + '×';
+      const s = streamer(); if (!s || !s.setZoom) return;
+      try { await s.setZoom({ factor: f }); } catch (e) {}
+    };
 
     $('preview').onclick = async () => {
       const s = streamer(); if (!s) return;
