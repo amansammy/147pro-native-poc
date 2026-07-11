@@ -409,12 +409,14 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    /// Thermal-adaptive target: throttle when hot, RESTORE to full when it cools.
+    /// Thermal-adaptive target. Only throttles at CRITICAL (genuine thermal risk /
+    /// imminent shutdown). "serious" is common under sustained 1080p60 and the phone
+    /// handles it fine, so we keep full bitrate there — the user wants their full
+    /// 12 Mbps. Restores automatically once it drops back below critical.
     private func bitrateForThermal() -> Int {
         switch ProcessInfo.processInfo.thermalState {
-        case .serious: return Int(Double(targetBitrate) * 0.6)
-        case .critical: return Int(Double(targetBitrate) * 0.4)
-        default: return targetBitrate   // nominal / fair → full quality
+        case .critical: return Int(Double(targetBitrate) * 0.65)
+        default: return targetBitrate   // nominal / fair / serious → full quality
         }
     }
 
