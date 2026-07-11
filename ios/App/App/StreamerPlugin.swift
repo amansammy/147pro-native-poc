@@ -28,8 +28,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "startPreview", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startStream", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stopStream", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "setLens", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "setLens", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setOverlay", returnType: CAPPluginReturnPromise)
     ]
+
+    // Scoreboard overlay, composited on the HaishinKit screen (so it appears in
+    // both the native preview and the encoded stream). @ScreenActor-isolated.
+    @ScreenActor private var scoreboard: TextScreenObject?
 
     // Single back camera, auto-managed capture session.
     private let mixer = MediaMixer(
@@ -139,6 +144,37 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Update the scoreboard overlay text. Proves web-driven overlays composite
+    /// into the native 1080p60 stream — the core feature. In the real app this
+    /// text is replaced by an ImageScreenObject fed the web scoreboard bitmap.
+    @objc func setOverlay(_ call: CAPPluginCall) {
+        let text = call.getString("text") ?? ""
+        Task {
+            await self.updateScoreboard(text)
+            self.reportDiag("overlay.set", ["text": text])
+            call.resolve()
+        }
+    }
+
+    @ScreenActor
+    private func updateScoreboard(_ text: String) {
+        if scoreboard == nil {
+            let t = TextScreenObject()
+            t.horizontalAlignment = .center
+            t.verticalAlignment = .top
+            t.layoutMargin = .init(top: 48, left: 0, bottom: 0, right: 0)
+            t.attributes = [
+                .font: UIFont.boldSystemFont(ofSize: 72),
+                .foregroundColor: UIColor.white,
+                .strokeColor: UIColor.black,
+                .strokeWidth: -4.0
+            ]
+            try? mixer.screen.addChild(t)
+            scoreboard = t
+        }
+        scoreboard?.string = text
+    }
+
     /// Live camera-lens switch. iPhone back lenses: "wide" (1x), "ultrawide"
     /// (0.5x), "tele" (3x); plus "front". Needed because the user's wide lens is
     /// physically damaged.
@@ -228,6 +264,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
 
         try await attachPreviewIfNeeded()
+        await updateScoreboard("0 - 0")
         isPreviewing = true
     }
 

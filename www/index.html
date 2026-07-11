@@ -89,7 +89,13 @@
           <div><label>FPS</label>
             <select id="fps"><option value="60" selected>60</option><option value="30">30</option></select>
           </div>
-          <div><label>Bitrate (kbps)</label><input id="bitrate" type="number" value="9000" /></div>
+          <div><label>Bitrate (kbps)</label><input id="bitrate" type="number" value="12000" /></div>
+        </div>
+        <label>Scoreboard overlay (simulates a live score update)</label>
+        <div class="lens-row">
+          <button class="lens" id="homeUp">Home +1</button>
+          <button class="lens" id="awayUp">Away +1</button>
+          <button class="lens" id="scoreReset">Reset</button>
         </div>
         <div class="btns">
           <button id="preview" class="act">Start Preview</button>
@@ -167,6 +173,18 @@
         }
       };
     });
+
+    // Scoreboard overlay — proves web-driven overlays composite into the native
+    // 1080p60 stream. Tapping a button pushes new text to the native TextScreenObject.
+    let scoreA = 0, scoreB = 0;
+    async function pushScore() {
+      const s = streamer(); if (!s || !s.setOverlay) return;
+      try { await s.setOverlay({ text: scoreA + ' - ' + scoreB }); }
+      catch (e) { log('setOverlay: ' + (e && e.message ? e.message : e)); }
+    }
+    $('homeUp').onclick = () => { scoreA++; pushScore(); };
+    $('awayUp').onclick = () => { scoreB++; pushScore(); };
+    $('scoreReset').onclick = () => { scoreA = 0; scoreB = 0; pushScore(); };
 
     $('preview').onclick = async () => {
       const s = streamer(); if (!s) return;
