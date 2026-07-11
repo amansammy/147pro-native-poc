@@ -42,7 +42,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     @objc func startPreview(_ call: CAPPluginCall) {
         let width = call.getInt("width") ?? 1920
         let height = call.getInt("height") ?? 1080
-        let fps = Float(call.getInt("fps") ?? 60)
+        let fps = Double(call.getInt("fps") ?? 60)
         Task {
             do {
                 try await self.setupPipeline(width: width, height: height, fps: fps)
@@ -62,7 +62,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         let width = call.getInt("width") ?? 1920
         let height = call.getInt("height") ?? 1080
-        let fps = Float(call.getInt("fps") ?? 60)
+        let fps = Double(call.getInt("fps") ?? 60)
         let bitrate = call.getInt("bitrate") ?? 9_000_000
         Task {
             do {
@@ -77,7 +77,6 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 var videoSettings = await stream.videoSettings
                 videoSettings.videoSize = CGSize(width: width, height: height)
                 videoSettings.bitRate = bitrate
-                videoSettings.expectedFrameRate = fps
                 await stream.setVideoSettings(videoSettings)
 
                 // YouTube: connect to the app URL (…/live2), publish with the key.
@@ -107,7 +106,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Pipeline
 
-    private func setupPipeline(width: Int, height: Int, fps: Float) async throws {
+    private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
         // Camera + mic.
         let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
         try? await mixer.attachVideo(camera, track: 0)
@@ -116,7 +115,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         // Output/composition size + capture frame rate. setFrameRate drives the
         // device toward a 60fps-capable format — the whole point of going native.
         await mixer.setFrameRate(fps)
-        await mixer.screen.size = CGSize(width: width, height: height)
+        // screen.size is @ScreenActor-isolated, so mutate it on that actor.
+        await setScreenSize(CGSize(width: width, height: height))
 
         // Create the RTMP stream up front so the preview can render through it,
         // even before we connect/publish.
@@ -152,6 +152,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         if let view = previewView, let stream = self.stream {
             await stream.addOutput(view)         // stream → preview
         }
+    }
+
+    // Mutations of the HaishinKit compositor screen must happen on @ScreenActor.
+    @ScreenActor
+    private func setScreenSize(_ size: CGSize) {
+        mixer.screen.size = size
     }
 
     private func emit(_ data: [String: Any]) {
