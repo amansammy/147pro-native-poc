@@ -1,0 +1,12 @@
+{
+  "appId": "com.pro147.poc",
+  "appName": "147 Pro PoC",
+  "webDir": "www",
+  "ios": {
+    "backgroundColor": "#00000000",
+    "contentInset": "always"
+  },
+  "server": {
+    "iosScheme": "capacitor"
+  }
+}

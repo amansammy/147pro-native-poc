@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>147 Pro — Native 1080p60 PoC</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; height: 100%;
+      /* Transparent so the NATIVE camera preview (rendered behind the WebView) shows through. */
+      background: transparent;
+      font-family: -apple-system, system-ui, sans-serif;
+      color: #fff;
+    }
+    #app { display: flex; flex-direction: column; height: 100%; }
+    .preview-hole { flex: 1; }  /* camera preview shows through here */
+    .panel {
+      background: rgba(10,12,16,0.82);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid rgba(255,255,255,0.12);
+      padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+    }
+    h1 { font-size: 15px; margin: 0 0 10px; font-weight: 600; opacity: 0.9; }
+    .row { display: flex; gap: 8px; margin-bottom: 8px; }
+    label { font-size: 11px; opacity: 0.7; display: block; margin-bottom: 3px; }
+    input, select {
+      width: 100%; padding: 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.06); color: #fff; font-size: 14px;
+    }
+    .btns { display: flex; gap: 10px; margin-top: 10px; }
+    button {
+      flex: 1; padding: 14px; border-radius: 12px; border: 0; font-size: 15px; font-weight: 600;
+      color: #fff; background: #2b6ef2;
+    }
+    button.live { background: #22a45d; }
+    button.stop { background: #d23f3f; }
+    button:disabled { opacity: 0.4; }
+    .status { font-size: 12px; margin-top: 10px; opacity: 0.85; min-height: 16px; white-space: pre-wrap; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#333; }
+    .badge.on { background:#22a45d; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="preview-hole"></div>
+    <div class="panel">
+      <h1>147 Pro — Native 1080p60 PoC <span id="state" class="badge">idle</span></h1>
+      <div class="row">
+        <div style="flex:2"><label>RTMP URL</label><input id="url" value="rtmp://a.rtmp.youtube.com/live2" /></div>
+      </div>
+      <div class="row">
+        <div style="flex:2"><label>Stream key (from YouTube)</label><input id="key" placeholder="xxxx-xxxx-xxxx-xxxx" /></div>
+      </div>
+      <div class="row">
+        <div><label>Resolution</label>
+          <select id="res">
+            <option value="1920x1080" selected>1080p</option>
+            <option value="1280x720">720p</option>
+          </select>
+        </div>
+        <div><label>FPS</label>
+          <select id="fps"><option value="60" selected>60</option><option value="30">30</option></select>
+        </div>
+        <div><label>Bitrate (kbps)</label><input id="bitrate" type="number" value="9000" /></div>
+      </div>
+      <div class="btns">
+        <button id="preview">Start Preview</button>
+        <button id="golive" class="live">Go Live</button>
+        <button id="stop" class="stop" disabled>Stop</button>
+      </div>
+      <div class="status" id="status">Waiting. Tap "Start Preview" to open the native camera.</div>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const statusEl = $('status');
+    const stateEl = $('state');
+    const log = (m) => { statusEl.textContent = m; console.log('[PoC]', m); };
+    const setState = (s, on) => { stateEl.textContent = s; stateEl.className = 'badge' + (on ? ' on' : ''); };
+
+    // Capacitor injects window.Capacitor in the native WebView; our native plugin
+    // registers under Capacitor.Plugins.Streamer.
+    function streamer() {
+      const s = window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.Streamer;
+      if (!s) { log('Native Streamer plugin not found — are you running the native app (not a browser)?'); return null; }
+      return s;
+    }
+
+    function parseRes() { const [w, h] = $('res').value.split('x').map(Number); return { width: w, height: h }; }
+
+    $('preview').onclick = async () => {
+      const s = streamer(); if (!s) return;
+      const { width, height } = parseRes();
+      try {
+        await s.startPreview({ width, height, fps: Number($('fps').value) });
+        setState('preview', false);
+        log('Preview started at ' + width + 'x' + height + ' @ ' + $('fps').value + 'fps. Point the camera, then Go Live.');
+      } catch (e) { log('startPreview error: ' + (e && e.message ? e.message : e)); }
+    };
+
+    $('golive').onclick = async () => {
+      const s = streamer(); if (!s) return;
+      const key = $('key').value.trim();
+      if (!key) { log('Paste your YouTube stream key first.'); return; }
+      const { width, height } = parseRes();
+      try {
+        await s.startStream({
+          url: $('url').value.trim(),
+          streamKey: key,
+          width, height,
+          fps: Number($('fps').value),
+          bitrate: Number($('bitrate').value) * 1000
+        });
+        setState('LIVE', true);
+        $('stop').disabled = false; $('golive').disabled = true; $('preview').disabled = true;
+        log('Going live… check YouTube Studio. Native is capturing ' + width + 'x' + height + '@' + $('fps').value + ' and pushing RTMP.');
+      } catch (e) { log('startStream error: ' + (e && e.message ? e.message : e)); }
+    };
+
+    $('stop').onclick = async () => {
+      const s = streamer(); if (!s) return;
+      try { await s.stopStream(); } catch (e) { log('stopStream error: ' + (e && e.message ? e.message : e)); }
+      setState('idle', false);
+      $('stop').disabled = true; $('golive').disabled = false; $('preview').disabled = false;
+      log('Stopped.');
+    };
+
+    // Surface native status events (fps, bitrate, connection, errors) if the plugin emits them.
+    document.addEventListener('DOMContentLoaded', () => {
+      const s = streamer();
+      if (s && s.addListener) {
+        s.addListener('status', (data) => { log(JSON.stringify(data)); });
+      }
+    });
+  </script>
+</body>
+</html>

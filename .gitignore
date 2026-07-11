@@ -1,0 +1,15 @@
+# Node
+node_modules/
+
+# Capacitor / iOS build artifacts
+ios/App/Pods/
+ios/App/App.xcworkspace/
+ios/App/build/
+build/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

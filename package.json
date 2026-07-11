@@ -1,0 +1,17 @@
+{
+  "name": "147pro-native-poc",
+  "version": "0.0.1",
+  "private": true,
+  "description": "147 Pro native streaming PoC — proves true 1080p60 via Capacitor + HaishinKit (RTMP direct to YouTube) with a static overlay.",
+  "scripts": {
+    "sync": "cap sync",
+    "add:ios": "cap add ios"
+  },
+  "dependencies": {
+    "@capacitor/core": "^7.0.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.0.0",
+    "@capacitor/ios": "^7.0.0"
+  }
+}

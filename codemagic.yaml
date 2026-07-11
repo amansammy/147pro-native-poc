@@ -1,0 +1,52 @@
+# Cloud macOS build for the 147 Pro native PoC — no Mac required.
+# Codemagic compiles + signs the iOS app and ships it to TestFlight, where it
+# installs OTA on the iPhone 11 Pro / 14 Pro Max.
+#
+# One-time setup in the Codemagic UI (I'll walk you through it):
+#   1. Add your App Store Connect API key as an integration named exactly: pro147_asc
+#   2. Register bundle id com.pro147.poc (Codemagic auto-manages signing with the key).
+workflows:
+  ios-poc:
+    name: 147 Pro Native PoC (iOS)
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+    integrations:
+      app_store_connect: pro147_asc
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.pro147.poc
+      vars:
+        BUNDLE_ID: "com.pro147.poc"
+        XCODE_WORKSPACE: "ios/App/App.xcworkspace"
+        XCODE_SCHEME: "App"
+      node: 20
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Install npm dependencies
+        script: npm ci
+      - name: Capacitor sync (iOS)
+        script: npx cap sync ios
+      - name: Pod install
+        script: |
+          cd ios/App && pod install
+      - name: Set up code signing
+        script: xcode-project use-profiles
+      - name: Set build number
+        script: |
+          cd ios/App
+          LATEST=$(app-store-connect get-latest-testflight-build-number "$BUNDLE_ID" 2>/dev/null || echo 0)
+          agvtool new-version -all $(($LATEST + 1))
+      - name: Build IPA
+        script: |
+          xcode-project build-ipa \
+            --workspace "$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
