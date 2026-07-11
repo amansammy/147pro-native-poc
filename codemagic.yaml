@@ -44,9 +44,10 @@ workflows:
     integrations:
       app_store_connect: pro147_asc
     environment:
-      ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.pro147.poc
+      # NOTE: no `ios_signing` block on purpose — that triggers Codemagic's
+      # automatic profile *fetch* at build start, which fails ("no matching
+      # profiles") because none exist yet. Instead we create them in the
+      # "Set up code signing" script below via the ASC API key (--create).
       vars:
         BUNDLE_ID: "com.pro147.poc"
         XCODE_WORKSPACE: "ios/App/App.xcworkspace"
