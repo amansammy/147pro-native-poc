@@ -206,6 +206,18 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             self.stream = stream
         }
 
+        // THE fps-0 FIX. MediaMixer defaults to VideoMixerSettings.mode == .passthrough.
+        // In passthrough the offscreen screen-compositor loop is stopped, and raw
+        // camera frames are only delivered to outputs whose videoTrackId == the
+        // capture track (0). But RTMPStream.videoTrackId defaults to UInt8.max, so it
+        // was NEVER receiving video — currentFPS 0 while audio (which has no such
+        // gate) flowed. Switching to .offscreen starts the screen display-link
+        // compositor, which renders the camera (track 0) into the 1920x1080 screen
+        // canvas and delivers it to UInt8.max outputs (our RTMPStream) → real video.
+        // This is also the mode the scoreboard overlay will need (mixer.screen).
+        await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
+        reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
+
         try await attachPreviewIfNeeded()
         isPreviewing = true
     }
