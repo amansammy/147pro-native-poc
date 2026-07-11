@@ -48,6 +48,8 @@ workflows:
       # automatic profile *fetch* at build start, which fails ("no matching
       # profiles") because none exist yet. Instead we create them in the
       # "Set up code signing" script below via the ASC API key (--create).
+      groups:
+        - signing   # provides CERTIFICATE_PRIVATE_KEY (our own signing key)
       vars:
         BUNDLE_ID: "com.pro147.poc"
         XCODE_WORKSPACE: "ios/App/App.xcworkspace"
@@ -71,6 +73,7 @@ workflows:
           # them if they don't exist yet), then wire them into the Xcode project.
           app-store-connect fetch-signing-files "$BUNDLE_ID" \
             --type IOS_APP_STORE \
+            --certificate-key=@env:CERTIFICATE_PRIVATE_KEY \
             --create
           keychain add-certificates
           xcode-project use-profiles
