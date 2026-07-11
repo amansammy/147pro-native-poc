@@ -6,6 +6,37 @@
 #   1. Add your App Store Connect API key as an integration named exactly: pro147_asc
 #   2. Register bundle id com.pro147.poc (Codemagic auto-manages signing with the key).
 workflows:
+  # Cheap compile check — no Apple account / signing needed. Use this first to
+  # shake out Swift/HaishinKit API errors before spending minutes on signing.
+  ios-compile:
+    name: iOS compile check (no signing)
+    max_build_duration: 45
+    instance_type: mac_mini_m2
+    environment:
+      node: 20
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Install npm dependencies
+        script: npm ci
+      - name: Capacitor sync (iOS)
+        script: npx cap sync ios
+      - name: Pod install
+        script: |
+          cd ios/App && pod install
+      - name: Compile (no code signing)
+        script: |
+          xcodebuild \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+    artifacts:
+      - /tmp/xcodebuild_logs/*.log
+
   ios-poc:
     name: 147 Pro Native PoC (iOS)
     max_build_duration: 60
