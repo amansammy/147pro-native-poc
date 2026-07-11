@@ -254,6 +254,31 @@
       log('Stopped.');
     };
 
+    // REMOTE SCOREBOARD. This (streaming) phone polls the droplet ~1x/sec; when the
+    // score text changes it pushes it to the native overlay. A SECOND phone drives it
+    // via the Safari control page at https://app.147pro.com/poc/control — so the
+    // scorer is separate from the camera, exactly like the main app's remote scoring.
+    // All scoreboard formatting lives server-side, so it can change with NO rebuild.
+    const SCORE_URL = 'https://app.147pro.com/poc/score';
+    let lastRemoteSeq = -1;
+    let remoteOn = true;
+    async function pollScore() {
+      if (!remoteOn) return;
+      try {
+        const r = await fetch(SCORE_URL, { cache: 'no-store' });
+        if (!r.ok) return;
+        const j = await r.json();
+        if (j && typeof j.seq === 'number' && j.seq !== lastRemoteSeq) {
+          lastRemoteSeq = j.seq;
+          if (j.text != null) {
+            const s = streamer();
+            if (s && s.setOverlay) { try { await s.setOverlay({ text: j.text }); } catch (e) {} }
+          }
+        }
+      } catch (e) {}
+    }
+    setInterval(pollScore, 1000);
+
     // Surface native status/diag events. media.tick is the money line: if fps>0 and
     // bytesPerSec>0, media IS reaching YouTube; if publish.ok fired but ticks stay 0,
     // the encoder/muxer isn't pushing.
