@@ -180,6 +180,16 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             reportDiag("attachAudio.noDevice", [:])
         }
 
+        // Landscape capture. This is THE fix for fps 0: the phone captures portrait
+        // by default, so a portrait buffer (e.g. 1080x1920) was hitting an encoder
+        // configured for 1920x1080 landscape — a size mismatch the H.264 encoder
+        // silently rejects, so ZERO video frames were produced while audio flowed.
+        // Forcing landscape makes the capture buffers 1920x1080, matching the
+        // encoder + screen size. It also fixes the "stays portrait in landscape"
+        // preview. (A snooker/pool stream is landscape anyway.)
+        await mixer.setVideoOrientation(.landscapeRight)
+        reportDiag("videoOrientation.set", ["orientation": "landscapeRight"])
+
         // Output/composition size + capture frame rate. setFrameRate drives the
         // device toward a 60fps-capable format — the whole point of going native.
         await mixer.setFrameRate(fps)
@@ -205,7 +215,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             await MainActor.run {
                 guard let container = self.bridge?.viewController?.view else { return }
                 let view = MTHKView(frame: container.bounds)
-                view.videoGravity = .resizeAspectFill
+                // .resizeAspect = show the true 16:9 landscape frame (WYSIWYG of
+                // what's streamed), rather than cropping to fill.
+                view.videoGravity = .resizeAspect
                 view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
                 // Behind the (transparent) Capacitor WebView so web UI floats on top.
                 container.insertSubview(view, at: 0)
