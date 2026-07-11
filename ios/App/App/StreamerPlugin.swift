@@ -2,6 +2,7 @@ import Foundation
 import Capacitor
 import HaishinKit
 import AVFoundation
+import VideoToolbox
 import UIKit
 
 /// Native streaming plugin for the 147 Pro PoC.
@@ -92,8 +93,16 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 var videoSettings = await stream.videoSettings
                 videoSettings.videoSize = CGSize(width: width, height: height)
                 videoSettings.bitRate = bitrate
+                // THE fps-0 FIX. VideoCodecSettings defaults profileLevel to
+                // kVTProfileLevel_H264_Baseline_3_1 — but H.264 Level 3.1 tops out at
+                // 1280x720. Feeding a 1920x1080 frame to a Baseline-3.1 VTCompression
+                // session makes VideoToolbox produce ZERO output (currentFPS 0) while
+                // audio still flows, so YouTube saw no video and dropped us. High +
+                // AutoLevel lets VideoToolbox pick Level 4.2 (needed for 1080p60) and
+                // is also the High profile we want for quality.
+                videoSettings.profileLevel = kVTProfileLevel_H264_High_AutoLevel as String
                 await stream.setVideoSettings(videoSettings)
-                self.reportDiag("videoSettings.applied", ["w": width, "h": height, "bitRate": bitrate])
+                self.reportDiag("videoSettings.applied", ["w": width, "h": height, "bitRate": bitrate, "profile": "H264_High_AutoLevel"])
 
                 // Begin draining status + media-flow BEFORE connect so we capture
                 // the RTMP handshake codes.
