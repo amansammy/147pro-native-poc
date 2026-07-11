@@ -12,10 +12,13 @@ import UIKit
 /// ceilings.
 ///
 /// Written against **HaishinKit 2.0.9** (the latest on CocoaPods trunk; 2.1/2.2
-/// are SPM-only). API verified from HaishinKit's own 2.0.9 IngestViewController
-/// example. v1 intentionally has NO overlay — first we prove 1080p60 lands on
-/// YouTube; the scoreboard overlay (ImageScreenObject / mixer.screen) is the next
-/// milestone once capture+encode+RTMP is green.
+/// are SPM-only). API verified from HaishinKit's own 2.0.9 sources.
+///
+/// This build is DIAGNOSTIC-HEAVY: every stage of go-live (attach, connect,
+/// publish) plus a live media-flow tick (fps / bytes / readyState) and both RTMP
+/// status streams are shipped to the droplet (`/_api/stream-diag`) AND emitted to
+/// the JS `status` listener, so we can see exactly why YouTube shows "no data"
+/// even though publish resolves.
 @objc(StreamerPlugin)
 public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let identifier = "StreamerPlugin"
@@ -23,7 +26,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "startPreview", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startStream", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "stopStream", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "stopStream", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setLens", returnType: CAPPluginReturnPromise)
     ]
 
     // Single back camera, auto-managed capture session.
@@ -36,6 +40,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var stream: RTMPStream?
     private var previewView: MTHKView?
     private var isPreviewing = false
+    private var currentLens = "wide"
+    private var observersStarted = false
 
     // MARK: - JS API
 
@@ -43,12 +49,14 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         let width = call.getInt("width") ?? 1920
         let height = call.getInt("height") ?? 1080
         let fps = Double(call.getInt("fps") ?? 60)
+        if let lens = call.getString("lens") { currentLens = lens }
         Task {
             do {
                 try await self.setupPipeline(width: width, height: height, fps: fps)
-                self.emit(["state": "preview", "width": width, "height": height, "fps": Int(fps)])
+                self.emit(["state": "preview", "width": width, "height": height, "fps": Int(fps), "lens": self.currentLens])
                 call.resolve()
             } catch {
+                self.reportDiag("startPreview.error", ["error": error.localizedDescription, "errorFull": "\(error)"])
                 call.reject("startPreview failed: \(error.localizedDescription)")
             }
         }
@@ -72,20 +80,38 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                     return
                 }
 
+                // Report camera/mic authorization — a denied mic is a common cause
+                // of YouTube showing "no data" (it wants an audio track).
+                self.reportDiag("perms", [
+                    "camera": "\(AVCaptureDevice.authorizationStatus(for: .video).rawValue)",
+                    "mic": "\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)"
+                ])
+
                 // Encoder settings — native encode, so we set the bitrate directly
                 // (no WebRTC GCC ramp) at true 1080p60.
                 var videoSettings = await stream.videoSettings
                 videoSettings.videoSize = CGSize(width: width, height: height)
                 videoSettings.bitRate = bitrate
                 await stream.setVideoSettings(videoSettings)
+                self.reportDiag("videoSettings.applied", ["w": width, "h": height, "bitRate": bitrate])
+
+                // Begin draining status + media-flow BEFORE connect so we capture
+                // the RTMP handshake codes.
+                self.startObservers()
 
                 // YouTube: connect to the app URL (…/live2), publish with the key.
+                self.reportDiag("connect.attempt", ["url": url])
                 _ = try await connection.connect(url)
+                self.reportDiag("connect.ok", ["connected": await connection.connected])
+
+                self.reportDiag("publish.attempt", ["keyPrefix": String(streamKey.prefix(4)) + "…"])
                 _ = try await stream.publish(streamKey)
+                self.reportDiag("publish.ok", ["readyState": "\(await stream.readyState)"])
 
                 self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
                 call.resolve()
             } catch {
+                self.reportDiag("startStream.error", ["error": error.localizedDescription, "errorFull": "\(error)"])
                 call.reject("startStream failed: \(error.localizedDescription)")
             }
         }
@@ -104,13 +130,55 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Live camera-lens switch. iPhone back lenses: "wide" (1x), "ultrawide"
+    /// (0.5x), "tele" (3x); plus "front". Needed because the user's wide lens is
+    /// physically damaged.
+    @objc func setLens(_ call: CAPPluginCall) {
+        let lens = call.getString("lens") ?? "wide"
+        Task {
+            guard let device = self.cameraDevice(for: lens) else {
+                self.reportDiag("lens.unavailable", ["lens": lens])
+                call.reject("lens '\(lens)' not available on this device")
+                return
+            }
+            do {
+                try await self.mixer.attachVideo(device, track: 0)
+                self.currentLens = lens
+                self.reportDiag("lens.set", ["lens": lens, "device": device.localizedName])
+                self.emit(["state": "lens", "lens": lens])
+                call.resolve(["lens": lens])
+            } catch {
+                self.reportDiag("lens.error", ["lens": lens, "error": error.localizedDescription])
+                call.reject("lens switch failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
+        // Proactively request mic access so audio actually attaches (YouTube wants
+        // an audio track); camera is prompted by attachVideo.
+        _ = await AVCaptureDevice.requestAccess(for: .audio)
+
         // Camera + mic.
-        let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-        try? await mixer.attachVideo(camera, track: 0)
-        try? await mixer.attachAudio(AVCaptureDevice.default(for: .audio))
+        let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        do {
+            try await mixer.attachVideo(camera, track: 0)
+            reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
+        } catch {
+            reportDiag("attachVideo.error", ["error": error.localizedDescription])
+        }
+        if let mic = AVCaptureDevice.default(for: .audio) {
+            do {
+                try await mixer.attachAudio(mic)
+                reportDiag("attachAudio.ok", ["device": mic.localizedName])
+            } catch {
+                reportDiag("attachAudio.error", ["error": error.localizedDescription])
+            }
+        } else {
+            reportDiag("attachAudio.noDevice", [:])
+        }
 
         // Output/composition size + capture frame rate. setFrameRate drives the
         // device toward a 60fps-capable format — the whole point of going native.
@@ -158,6 +226,76 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     @ScreenActor
     private func setScreenSize(_ size: CGSize) {
         mixer.screen.size = size
+    }
+
+    private func cameraDevice(for lens: String) -> AVCaptureDevice? {
+        switch lens {
+        case "ultrawide":
+            return AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back)
+        case "tele":
+            return AVCaptureDevice.default(.builtInTelephotoCamera, for: .video, position: .back)
+        case "front":
+            return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)
+        default:
+            return AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        }
+    }
+
+    // MARK: - Diagnostics
+
+    /// Drain both RTMP status streams and poll media-flow so we can see whether
+    /// bytes/frames are actually leaving the device after publish resolves.
+    private func startObservers() {
+        guard !observersStarted, let connection = self.connection, let stream = self.stream else { return }
+        observersStarted = true
+
+        Task { [weak self] in
+            let statusStream = await connection.status
+            for await s in statusStream {
+                self?.reportDiag("rtmp.connection.status", ["code": "\(s.code)", "level": "\(s.level)"])
+            }
+        }
+        Task { [weak self] in
+            let statusStream = await stream.status
+            for await s in statusStream {
+                self?.reportDiag("rtmp.stream.status", ["code": "\(s.code)", "level": "\(s.level)"])
+            }
+        }
+        // Media-flow ticks: fps>0 and bytesPerSec>0 => media IS reaching YouTube.
+        Task { [weak self] in
+            for _ in 0..<30 {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard let self, let stream = self.stream, let connection = self.connection else { break }
+                let fps = await stream.currentFPS
+                let ready = await stream.readyState
+                let connected = await connection.connected
+                let info = await stream.info
+                self.reportDiag("media.tick", [
+                    "fps": Int(fps),
+                    "readyState": "\(ready)",
+                    "connected": connected,
+                    "byteCount": info.byteCount,
+                    "bytesPerSec": info.currentBytesPerSecond
+                ])
+            }
+        }
+    }
+
+    private func reportDiag(_ event: String, _ extra: [String: Any]) {
+        var dict: [String: Any] = [
+            "kind": "native-stream-diag",
+            "event": event,
+            "t": ISO8601DateFormatter().string(from: Date())
+        ]
+        for (k, v) in extra { dict[k] = v }
+        emit(dict)
+        guard let url = URL(string: "https://app.147pro.com/_api/stream-diag"),
+              let body = try? JSONSerialization.data(withJSONObject: dict) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("text/plain", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     private func emit(_ data: [String: Any]) {

@@ -20,58 +20,86 @@
       background: rgba(10,12,16,0.82);
       backdrop-filter: blur(12px);
       border-top: 1px solid rgba(255,255,255,0.12);
-      padding: 14px 16px calc(14px + env(safe-area-inset-bottom));
+      padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+      /* Never let the panel eat the whole screen (esp. in landscape). It becomes a
+         scrollable bottom sheet, and can be collapsed to just its header. */
+      max-height: 62vh;
+      overflow-y: auto;
     }
-    h1 { font-size: 15px; margin: 0 0 10px; font-weight: 600; opacity: 0.9; }
+    .panel.collapsed .collapsible { display: none; }
+    .panel.collapsed { max-height: none; }
+    .hdr { display:flex; align-items:center; gap:8px; }
+    h1 { font-size: 14px; margin: 0; font-weight: 600; opacity: 0.9; flex: 1; }
+    .toggle { background: rgba(255,255,255,0.12); border:0; color:#fff; border-radius:8px;
+      padding:6px 12px; font-size:13px; font-weight:600; flex:0 0 auto; }
+    .collapsible { margin-top: 10px; }
     .row { display: flex; gap: 8px; margin-bottom: 8px; }
     label { font-size: 11px; opacity: 0.7; display: block; margin-bottom: 3px; }
     input, select {
       width: 100%; padding: 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
       background: rgba(255,255,255,0.06); color: #fff; font-size: 14px;
     }
-    .btns { display: flex; gap: 10px; margin-top: 10px; }
-    button {
+    .lens-row { display:flex; gap:6px; margin-bottom:8px; }
+    .lens { flex:1; padding:9px 4px; border-radius:10px; border:1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.06); color:#fff; font-size:13px; font-weight:600; }
+    .lens.active { background:#2b6ef2; border-color:#2b6ef2; }
+    .btns { display: flex; gap: 10px; margin-top: 6px; }
+    button.act {
       flex: 1; padding: 14px; border-radius: 12px; border: 0; font-size: 15px; font-weight: 600;
       color: #fff; background: #2b6ef2;
     }
     button.live { background: #22a45d; }
     button.stop { background: #d23f3f; }
     button:disabled { opacity: 0.4; }
-    .status { font-size: 12px; margin-top: 10px; opacity: 0.85; min-height: 16px; white-space: pre-wrap; }
+    .status { font-size: 12px; margin-top: 8px; opacity: 0.9; min-height: 16px; white-space: pre-wrap; }
     .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; background:#333; }
     .badge.on { background:#22a45d; }
+    .tick { font-size:11px; opacity:0.8; margin-top:4px; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
   <div id="app">
     <div class="preview-hole"></div>
-    <div class="panel">
-      <h1>147 Pro — Native 1080p60 PoC <span id="state" class="badge">idle</span></h1>
-      <div class="row">
-        <div style="flex:2"><label>RTMP URL</label><input id="url" value="rtmp://a.rtmp.youtube.com/live2" /></div>
+    <div class="panel" id="panel">
+      <div class="hdr">
+        <h1>147 Pro — Native 1080p60 PoC <span id="state" class="badge">idle</span></h1>
+        <button class="toggle" id="toggle">Hide</button>
       </div>
-      <div class="row">
-        <div style="flex:2"><label>Stream key (from YouTube)</label><input id="key" placeholder="xxxx-xxxx-xxxx-xxxx" /></div>
-      </div>
-      <div class="row">
-        <div><label>Resolution</label>
-          <select id="res">
-            <option value="1920x1080" selected>1080p</option>
-            <option value="1280x720">720p</option>
-          </select>
+      <div class="collapsible" id="collapsible">
+        <div class="row">
+          <div style="flex:2"><label>RTMP URL</label><input id="url" value="rtmp://a.rtmp.youtube.com/live2" /></div>
         </div>
-        <div><label>FPS</label>
-          <select id="fps"><option value="60" selected>60</option><option value="30">30</option></select>
+        <div class="row">
+          <div style="flex:2"><label>Stream key (from YouTube)</label><input id="key" placeholder="xxxx-xxxx-xxxx-xxxx" /></div>
         </div>
-        <div><label>Bitrate (kbps)</label><input id="bitrate" type="number" value="9000" /></div>
+        <label>Lens (your wide lens is broken — pick another)</label>
+        <div class="lens-row">
+          <button class="lens" data-lens="ultrawide">Ultra 0.5×</button>
+          <button class="lens active" data-lens="wide">Wide 1×</button>
+          <button class="lens" data-lens="tele">Tele 3×</button>
+          <button class="lens" data-lens="front">Front</button>
+        </div>
+        <div class="row">
+          <div><label>Resolution</label>
+            <select id="res">
+              <option value="1920x1080" selected>1080p</option>
+              <option value="1280x720">720p</option>
+            </select>
+          </div>
+          <div><label>FPS</label>
+            <select id="fps"><option value="60" selected>60</option><option value="30">30</option></select>
+          </div>
+          <div><label>Bitrate (kbps)</label><input id="bitrate" type="number" value="9000" /></div>
+        </div>
+        <div class="btns">
+          <button id="preview" class="act">Start Preview</button>
+          <button id="golive" class="act live">Go Live</button>
+          <button id="stop" class="act stop" disabled>Stop</button>
+        </div>
+        <div class="status" id="status">Waiting. Tap "Start Preview" to open the native camera.</div>
+        <div class="tick" id="tick"></div>
+        <pre class="status" id="debug" style="max-height:120px; overflow:auto; font-size:10px; line-height:1.3;"></pre>
       </div>
-      <div class="btns">
-        <button id="preview">Start Preview</button>
-        <button id="golive" class="live">Go Live</button>
-        <button id="stop" class="stop" disabled>Stop</button>
-      </div>
-      <div class="status" id="status">Waiting. Tap "Start Preview" to open the native camera.</div>
-      <pre class="status" id="debug" style="max-height:140px; overflow:auto; font-size:10px; line-height:1.3;"></pre>
     </div>
   </div>
 
@@ -79,64 +107,74 @@
     const $ = (id) => document.getElementById(id);
     const statusEl = $('status');
     const stateEl = $('state');
+    const tickEl = $('tick');
     const log = (m) => { statusEl.textContent = m; console.log('[PoC]', m); };
     const setState = (s, on) => { stateEl.textContent = s; stateEl.className = 'badge' + (on ? ' on' : ''); };
 
-    // Capacitor injects window.Capacitor in the native WebView. Custom native
-    // plugins must be obtained via registerPlugin('<jsName>') — the old
-    // Capacitor.Plugins.X global is NOT populated for custom plugins in
-    // Capacitor 6/7, which is why the first build said "plugin not found".
+    let currentLens = 'wide';
+
+    // Capacitor injects window.Capacitor in the native WebView. Our app-local
+    // Streamer plugin is registered natively (MainViewController.capacitorDidLoad
+    // -> registerPluginInstance), which JSExports it into Capacitor.Plugins.Streamer.
     let _streamer = null;
     function streamer() {
       if (_streamer) return _streamer;
       const cap = window.Capacitor;
       if (!cap) { log('window.Capacitor is undefined (bridge not injected).'); return null; }
-      if (typeof cap.registerPlugin === 'function') { _streamer = cap.registerPlugin('Streamer'); return _streamer; }
       if (cap.Plugins && cap.Plugins.Streamer) { _streamer = cap.Plugins.Streamer; return _streamer; }
+      if (typeof cap.registerPlugin === 'function') { _streamer = cap.registerPlugin('Streamer'); return _streamer; }
       log('Capacitor present but Streamer handle not obtainable — see debug dump.');
       return null;
     }
 
-    // Introspect what the native bridge actually exposes on this device.
     function diag() {
       const cap = window.Capacitor;
       return {
-        kind: 'poc-diag',
-        t: new Date().toISOString(),
+        kind: 'poc-diag', t: new Date().toISOString(),
         hasCapacitor: !!cap,
-        capacitorKeys: cap ? Object.keys(cap) : null,
-        typeofRegisterPlugin: cap ? (typeof cap.registerPlugin) : 'no-cap',
-        platform: (cap && typeof cap.getPlatform === 'function') ? cap.getPlatform() : (cap && cap.platform) || null,
-        isNative: (cap && typeof cap.isNativePlatform === 'function') ? cap.isNativePlatform() : null,
-        hasPlugins: !!(cap && cap.Plugins),
         pluginKeys: (cap && cap.Plugins) ? Object.keys(cap.Plugins) : null,
         hasStreamerInPlugins: !!(cap && cap.Plugins && cap.Plugins.Streamer),
         ua: navigator.userAgent
       };
     }
-    // Ship the dump to the droplet (text/plain avoids a CORS preflight; no-cors
-    // = fire-and-forget). Same sink as the main app's stream-diag telemetry.
     function postDiag(info) {
       try {
         fetch('https://app.147pro.com/_api/stream-diag', {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain' },
-          body: JSON.stringify(info),
-          mode: 'no-cors',
-          keepalive: true
+          method: 'POST', headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify(info), mode: 'no-cors', keepalive: true
         }).catch(function(){});
       } catch (e) {}
     }
 
     function parseRes() { const [w, h] = $('res').value.split('x').map(Number); return { width: w, height: h }; }
 
+    // Collapse/expand so the panel never buries the camera preview (landscape fix).
+    $('toggle').onclick = () => {
+      const p = $('panel');
+      const c = p.classList.toggle('collapsed');
+      $('toggle').textContent = c ? 'Show' : 'Hide';
+    };
+
+    // Lens selection — updates highlight, and switches live if preview is running.
+    document.querySelectorAll('.lens').forEach((btn) => {
+      btn.onclick = async () => {
+        currentLens = btn.dataset.lens;
+        document.querySelectorAll('.lens').forEach((b) => b.classList.toggle('active', b === btn));
+        const s = streamer();
+        if (s && s.setLens) {
+          try { await s.setLens({ lens: currentLens }); log('Lens → ' + currentLens); }
+          catch (e) { log('setLens: ' + (e && e.message ? e.message : e)); }
+        }
+      };
+    });
+
     $('preview').onclick = async () => {
       const s = streamer(); if (!s) return;
       const { width, height } = parseRes();
       try {
-        await s.startPreview({ width, height, fps: Number($('fps').value) });
+        await s.startPreview({ width, height, fps: Number($('fps').value), lens: currentLens });
         setState('preview', false);
-        log('Preview started at ' + width + 'x' + height + ' @ ' + $('fps').value + 'fps. Point the camera, then Go Live.');
+        log('Preview at ' + width + 'x' + height + '@' + $('fps').value + ' (' + currentLens + '). Point camera, then Go Live.');
       } catch (e) { log('startPreview error: ' + (e && e.message ? e.message : e)); }
     };
 
@@ -147,15 +185,12 @@
       const { width, height } = parseRes();
       try {
         await s.startStream({
-          url: $('url').value.trim(),
-          streamKey: key,
-          width, height,
-          fps: Number($('fps').value),
-          bitrate: Number($('bitrate').value) * 1000
+          url: $('url').value.trim(), streamKey: key, width, height,
+          fps: Number($('fps').value), bitrate: Number($('bitrate').value) * 1000
         });
         setState('LIVE', true);
         $('stop').disabled = false; $('golive').disabled = true; $('preview').disabled = true;
-        log('Going live… check YouTube Studio. Native is capturing ' + width + 'x' + height + '@' + $('fps').value + ' and pushing RTMP.');
+        log('Going live… watch the tick line below for fps/bytes leaving the device.');
       } catch (e) { log('startStream error: ' + (e && e.message ? e.message : e)); }
     };
 
@@ -167,14 +202,25 @@
       log('Stopped.');
     };
 
-    // Surface native status events (fps, bitrate, connection, errors) if the plugin emits them.
+    // Surface native status/diag events. media.tick is the money line: if fps>0 and
+    // bytesPerSec>0, media IS reaching YouTube; if publish.ok fired but ticks stay 0,
+    // the encoder/muxer isn't pushing.
     document.addEventListener('DOMContentLoaded', () => {
       const info = diag();
-      document.getElementById('debug').textContent = JSON.stringify(info, null, 1);
+      $('debug').textContent = JSON.stringify(info, null, 1);
       postDiag(info);
       const s = streamer();
       if (s && s.addListener) {
-        try { s.addListener('status', (data) => { log(JSON.stringify(data)); }); } catch (e) {}
+        try {
+          s.addListener('status', (d) => {
+            if (d && d.event === 'media.tick') {
+              tickEl.textContent = 'fps ' + d.fps + ' · ' + Math.round((d.bytesPerSec||0)/1024) + ' KB/s · ' +
+                (d.byteCount||0) + ' B total · ' + d.readyState + (d.connected ? ' · connected' : '');
+            } else if (d && d.event) {
+              log(d.event + (d.error ? ': ' + d.error : (d.code ? ': ' + d.code : '')));
+            }
+          });
+        } catch (e) {}
       }
     });
   </script>
