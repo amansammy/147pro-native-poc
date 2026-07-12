@@ -27,7 +27,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "setOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "updateOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setPreviewRect", returnType: CAPPluginReturnPromise)
     ]
 
     // Scoreboard overlays composited on the HaishinKit screen (appear in both the
@@ -46,6 +47,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var connection: RTMPConnection?
     private var stream: RTMPStream?
     private var previewView: MTHKView?
+    // Where the web wants the camera preview drawn (CSS px == UIKit points, in
+    // web-viewport coords). The preview view is placed ON TOP of the WebView at
+    // this rect so it shows inside the app's preview box (the camera renders on
+    // a WKWebView so it can't be revealed by making the DOM transparent). A zero
+    // rect hides it.
+    private var previewRect: CGRect?
     private var currentLens = "wide"
     private var currentDevice: AVCaptureDevice?
     private var observersStarted = false
@@ -368,20 +375,62 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         if previewView == nil {
             await MainActor.run {
                 guard let container = self.bridge?.viewController?.view else { return }
-                let view = MTHKView(frame: container.bounds)
+                // Place the preview ON TOP of the WebView (not behind it): the
+                // camera can't be revealed through the opaque app DOM, so we
+                // overlay it onto the web preview box via setPreviewRect. Start
+                // hidden until the web sends the box rect.
+                let view = MTHKView(frame: .zero)
                 view.videoGravity = .resizeAspect
-                view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-                container.insertSubview(view, at: 0)
+                view.isHidden = true
+                container.addSubview(view)
                 self.previewView = view
-                if let webView = self.bridge?.webView {
-                    webView.isOpaque = false
-                    webView.backgroundColor = .clear
-                    webView.scrollView.backgroundColor = .clear
-                }
             }
         }
         if let view = previewView, let stream = self.stream {
             await stream.addOutput(view)
+        }
+        await self.applyPreviewRect()
+    }
+
+    /// Position the camera preview onto the web-provided box rect, on top of the
+    /// WebView. Rect is in web-viewport points; convert to the container's
+    /// coordinate space by adding the WebView origin + its content inset (status
+    /// bar / safe area). A zero-size rect hides the preview.
+    @MainActor
+    private func applyPreviewRect() {
+        guard let view = self.previewView else { return }
+        guard let rect = self.previewRect, rect.width > 1, rect.height > 1 else {
+            view.isHidden = true
+            return
+        }
+        guard let container = self.bridge?.viewController?.view else { return }
+        var offsetX: CGFloat = 0
+        var offsetY: CGFloat = 0
+        if let webView = self.bridge?.webView {
+            let inset = webView.scrollView.adjustedContentInset
+            let originInContainer = webView.convert(CGPoint(x: inset.left, y: inset.top), to: container)
+            offsetX = originInContainer.x
+            offsetY = originInContainer.y
+        }
+        view.frame = CGRect(
+            x: offsetX + rect.origin.x,
+            y: offsetY + rect.origin.y,
+            width: rect.width,
+            height: rect.height
+        )
+        container.bringSubviewToFront(view)
+        view.isHidden = false
+    }
+
+    @objc func setPreviewRect(_ call: CAPPluginCall) {
+        let x = CGFloat(call.getDouble("x") ?? 0)
+        let y = CGFloat(call.getDouble("y") ?? 0)
+        let w = CGFloat(call.getDouble("width") ?? 0)
+        let h = CGFloat(call.getDouble("height") ?? 0)
+        self.previewRect = CGRect(x: x, y: y, width: w, height: h)
+        Task { @MainActor in
+            self.applyPreviewRect()
+            call.resolve()
         }
     }
 
