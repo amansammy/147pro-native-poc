@@ -4,6 +4,7 @@ import HaishinKit
 import AVFoundation
 import VideoToolbox
 import UIKit
+import AuthenticationServices
 
 /// Native streaming plugin for the 147 Pro PoC.
 ///
@@ -28,8 +29,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "updateOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "setPreviewRect", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "setPreviewRect", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "startOAuth", returnType: CAPPluginReturnPromise)
     ]
+
+    // Retained so the auth session isn't deallocated mid-flow.
+    private var authSession: ASWebAuthenticationSession?
 
     // Scoreboard overlays composited on the HaishinKit screen (appear in both the
     // native preview and the encoded stream). @ScreenActor-isolated.
@@ -454,6 +459,40 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Open an OAuth flow in the system browser (Safari) via
+    /// ASWebAuthenticationSession — this uses a real Safari user-agent, so
+    /// Google does NOT block it with disallowed_useragent (unlike the WKWebView).
+    /// The server callback redirects to `callbackScheme://…?tempToken=…`, which
+    /// this session captures and returns to JS. JS then exchanges the temp token
+    /// for a real session cookie in the WebView. Reuses the existing verified
+    /// OAuth client — Google still redirects to the same https callback and never
+    /// sees the custom scheme, so no re-verification is needed.
+    @objc func startOAuth(_ call: CAPPluginCall) {
+        guard let urlString = call.getString("url"),
+              let authURL = URL(string: urlString),
+              let scheme = call.getString("callbackScheme") else {
+            call.reject("url and callbackScheme are required")
+            return
+        }
+        DispatchQueue.main.async {
+            let session = ASWebAuthenticationSession(url: authURL, callbackURLScheme: scheme) { callbackURL, error in
+                if let error = error {
+                    call.reject("OAuth failed or cancelled: \(error.localizedDescription)")
+                    return
+                }
+                guard let callbackURL = callbackURL else {
+                    call.reject("No callback URL returned from OAuth")
+                    return
+                }
+                call.resolve(["url": callbackURL.absoluteString])
+            }
+            session.presentationContextProvider = self
+            session.prefersEphemeralWebBrowserSession = false
+            self.authSession = session
+            session.start()
+        }
+    }
+
     @objc func setPreviewRect(_ call: CAPPluginCall) {
         let x = CGFloat(call.getDouble("x") ?? 0)
         let y = CGFloat(call.getDouble("y") ?? 0)
@@ -636,5 +675,11 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     private func emit(_ data: [String: Any]) {
         notifyListeners("status", data: data)
+    }
+}
+
+extension StreamerPlugin: ASWebAuthenticationPresentationContextProviding {
+    public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return self.bridge?.viewController?.view.window ?? ASPresentationAnchor()
     }
 }
