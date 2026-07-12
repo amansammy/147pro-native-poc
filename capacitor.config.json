@@ -1,12 +1,21 @@
 {
   "appId": "com.pro147.poc",
-  "appName": "147 Pro PoC",
+  "appName": "147 Pro",
   "webDir": "www",
   "ios": {
     "backgroundColor": "#00000000",
     "contentInset": "always"
   },
   "server": {
-    "iosScheme": "capacitor"
+    "iosScheme": "capacitor",
+    "url": "https://app.147pro.com",
+    "allowNavigation": [
+      "app.147pro.com",
+      "accounts.google.com",
+      "*.google.com",
+      "*.youtube.com",
+      "checkout.stripe.com",
+      "*.stripe.com"
+    ]
   }
 }
