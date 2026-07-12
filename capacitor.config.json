@@ -6,6 +6,7 @@
     "backgroundColor": "#00000000",
     "contentInset": "always"
   },
+  "appendUserAgent": "147ProNative",
   "server": {
     "iosScheme": "capacitor",
     "url": "https://staging.147pro.com",
