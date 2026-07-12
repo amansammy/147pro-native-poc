@@ -380,9 +380,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 // overlay it onto the web preview box via setPreviewRect. Start
                 // hidden until the web sends the box rect.
                 let view = MTHKView(frame: .zero)
-                view.videoGravity = .resizeAspect
+                view.videoGravity = .resizeAspectFill
                 view.isHidden = true
                 view.isUserInteractionEnabled = true
+                // Rounded corners to match the web preview box styling.
+                view.layer.cornerRadius = 16
+                view.clipsToBounds = true
                 // Pinch-to-zoom directly on the camera preview (the web zoom
                 // control can't float over this native layer). Adjusts the
                 // active device's videoZoomFactor live.
