@@ -8,8 +8,9 @@
   },
   "server": {
     "iosScheme": "capacitor",
-    "url": "https://app.147pro.com",
+    "url": "https://staging.147pro.com",
     "allowNavigation": [
+      "staging.147pro.com",
       "app.147pro.com",
       "accounts.google.com",
       "*.google.com",
