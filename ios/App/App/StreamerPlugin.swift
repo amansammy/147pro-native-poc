@@ -382,6 +382,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 let view = MTHKView(frame: .zero)
                 view.videoGravity = .resizeAspect
                 view.isHidden = true
+                view.isUserInteractionEnabled = true
+                // Pinch-to-zoom directly on the camera preview (the web zoom
+                // control can't float over this native layer). Adjusts the
+                // active device's videoZoomFactor live.
+                let pinch = UIPinchGestureRecognizer(target: self, action: #selector(self.handlePinch(_:)))
+                view.addGestureRecognizer(pinch)
                 container.addSubview(view)
                 self.previewView = view
             }
@@ -420,6 +426,29 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         )
         container.bringSubviewToFront(view)
         view.isHidden = false
+    }
+
+    private var pinchBaseZoom: CGFloat = 1.0
+
+    @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
+        guard let device = self.currentDevice else { return }
+        switch gesture.state {
+        case .began:
+            pinchBaseZoom = device.videoZoomFactor
+        case .changed:
+            let maxZoom = min(device.maxAvailableVideoZoomFactor, 10.0)
+            let newZoom = max(1.0, min(pinchBaseZoom * gesture.scale, maxZoom))
+            do {
+                try device.lockForConfiguration()
+                device.videoZoomFactor = newZoom
+                device.unlockForConfiguration()
+                self.emit(["state": "zoom", "factor": Double(newZoom)])
+            } catch {
+                self.reportDiag("pinch.error", ["error": error.localizedDescription])
+            }
+        default:
+            break
+        }
     }
 
     @objc func setPreviewRect(_ call: CAPPluginCall) {
