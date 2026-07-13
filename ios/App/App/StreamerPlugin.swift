@@ -385,7 +385,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 // overlay it onto the web preview box via setPreviewRect. Start
                 // hidden until the web sends the box rect.
                 let view = MTHKView(frame: .zero)
-                view.videoGravity = .resizeAspectFill
+                // resizeAspect (NOT resizeAspectFill): show the FULL composited
+                // 16:9 frame so the scoreboard (bottom of the frame) is visible in
+                // the preview. resizeAspectFill crops top+bottom on a wide box,
+                // which cut the scoreboard off the preview (it was still on the
+                // encoded stream). The PoC used resizeAspect and showed the board.
+                view.videoGravity = .resizeAspect
                 view.isHidden = true
                 view.isUserInteractionEnabled = true
                 // Rounded corners to match the web preview box styling.
