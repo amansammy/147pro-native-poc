@@ -61,6 +61,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var currentLens = "wide"
     private var currentDevice: AVCaptureDevice?
     private var observersStarted = false
+    // The capture session (camera/mic/preset) is configured ONCE. Re-attaching it
+    // while streaming resets capture and drops the live RTMP connection — the
+    // go-live freeze / YouTube "no data" bug when JS calls setupPipeline repeatedly.
+    private var captureConfigured = false
+    private var configuredWidth = 0
+    private var configuredHeight = 0
+    private var previewAddedToStream = false
 
     // Stream params retained for auto-reconnect + thermal-adaptive bitrate.
     private var streamURL: String?
@@ -325,36 +332,46 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
-        _ = await AVCaptureDevice.requestAccess(for: .audio)
+        // Configure the CAPTURE session only once (or if the resolution changes).
+        // Skipping this on repeated calls is what keeps a live stream stable when
+        // JS re-invokes setupPipeline (preview effect / go-live) — re-attaching
+        // camera/mic mid-stream was closing the RTMP connection.
+        if !captureConfigured || configuredWidth != width || configuredHeight != height {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
 
-        // Capture at true native res (default preset is 720p → upscaled).
-        let preset = sessionPreset(for: width, height: height)
-        await mixer.setSessionPreset(preset)
-        reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
+            // Capture at true native res (default preset is 720p → upscaled).
+            let preset = sessionPreset(for: width, height: height)
+            await mixer.setSessionPreset(preset)
+            reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
 
-        let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-        self.currentDevice = camera
-        do {
-            try await mixer.attachVideo(camera, track: 0)
-            reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
-        } catch {
-            reportDiag("attachVideo.error", ["error": error.localizedDescription])
-        }
-        if let mic = AVCaptureDevice.default(for: .audio) {
+            let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+            self.currentDevice = camera
             do {
-                try await mixer.attachAudio(mic)
-                reportDiag("attachAudio.ok", ["device": mic.localizedName])
+                try await mixer.attachVideo(camera, track: 0)
+                reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
             } catch {
-                reportDiag("attachAudio.error", ["error": error.localizedDescription])
+                reportDiag("attachVideo.error", ["error": error.localizedDescription])
             }
-        } else {
-            reportDiag("attachAudio.noDevice", [:])
-        }
+            if let mic = AVCaptureDevice.default(for: .audio) {
+                do {
+                    try await mixer.attachAudio(mic)
+                    reportDiag("attachAudio.ok", ["device": mic.localizedName])
+                } catch {
+                    reportDiag("attachAudio.error", ["error": error.localizedDescription])
+                }
+            } else {
+                reportDiag("attachAudio.noDevice", [:])
+            }
 
-        // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
-        await mixer.setVideoOrientation(.landscapeRight)
-        await mixer.setFrameRate(fps)
-        await setScreenSize(CGSize(width: width, height: height))
+            // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
+            await mixer.setVideoOrientation(.landscapeRight)
+            await mixer.setFrameRate(fps)
+            await setScreenSize(CGSize(width: width, height: height))
+
+            captureConfigured = true
+            configuredWidth = width
+            configuredHeight = height
+        }
 
         // Create the RTMP objects if not already present (kept across preview→live;
         // recreated fresh after a stop).
@@ -364,6 +381,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             await mixer.addOutput(stream)
             self.connection = connection
             self.stream = stream
+            self.previewAddedToStream = false // new stream needs the preview re-attached
         }
 
         // .offscreen runs the screen compositor so camera + overlay reach the encoder
@@ -405,8 +423,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.previewView = view
             }
         }
-        if let view = previewView, let stream = self.stream {
+        if let view = previewView, let stream = self.stream, !previewAddedToStream {
             await stream.addOutput(view)
+            previewAddedToStream = true
         }
         await self.applyPreviewRect()
     }
