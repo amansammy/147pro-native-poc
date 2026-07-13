@@ -52,6 +52,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var connection: RTMPConnection?
     private var stream: RTMPStream?
     private var previewView: MTHKView?
+    // A clipping wrapper around the MTHKView — cornerRadius on a Metal view
+    // (MTHKView) doesn't clip its drawable, so we round the CONTAINER instead.
+    private var previewContainer: UIView?
     // Where the web wants the camera preview drawn (CSS px == UIKit points, in
     // web-viewport coords). The preview view is placed ON TOP of the WebView at
     // this rect so it shows inside the app's preview box (the camera renders on
@@ -399,28 +402,31 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         if previewView == nil {
             await MainActor.run {
                 guard let container = self.bridge?.viewController?.view else { return }
-                // Place the preview ON TOP of the WebView (not behind it): the
-                // camera can't be revealed through the opaque app DOM, so we
-                // overlay it onto the web preview box via setPreviewRect. Start
-                // hidden until the web sends the box rect.
-                let view = MTHKView(frame: .zero)
+                // Rounded clipping wrapper (the MTHKView's own cornerRadius won't
+                // clip its Metal drawable). The MTHKView fills the wrapper.
+                let wrap = UIView(frame: .zero)
+                wrap.layer.cornerRadius = 16
+                wrap.layer.masksToBounds = true
+                wrap.clipsToBounds = true
+                wrap.backgroundColor = .clear
+                wrap.isHidden = true
+                wrap.isUserInteractionEnabled = true
+
                 // resizeAspect (NOT resizeAspectFill): show the FULL composited
-                // 16:9 frame so the scoreboard (bottom of the frame) is visible in
-                // the preview. resizeAspectFill crops top+bottom on a wide box,
-                // which cut the scoreboard off the preview (it was still on the
-                // encoded stream). The PoC used resizeAspect and showed the board.
+                // 16:9 frame so the scoreboard (bottom of the frame) stays visible.
+                let view = MTHKView(frame: wrap.bounds)
                 view.videoGravity = .resizeAspect
-                view.isHidden = true
-                view.isUserInteractionEnabled = true
-                // Rounded corners to match the web preview box styling.
-                view.layer.cornerRadius = 16
-                view.clipsToBounds = true
-                // Pinch-to-zoom directly on the camera preview (the web zoom
-                // control can't float over this native layer). Adjusts the
-                // active device's videoZoomFactor live.
+                view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+
+                // Pinch-to-zoom directly on the preview (the web zoom control
+                // can't float over this native layer). On the wrapper so it works
+                // across the whole preview area.
                 let pinch = UIPinchGestureRecognizer(target: self, action: #selector(self.handlePinch(_:)))
-                view.addGestureRecognizer(pinch)
-                container.addSubview(view)
+                wrap.addGestureRecognizer(pinch)
+
+                wrap.addSubview(view)
+                container.addSubview(wrap)
+                self.previewContainer = wrap
                 self.previewView = view
             }
         }
@@ -437,9 +443,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     /// bar / safe area). A zero-size rect hides the preview.
     @MainActor
     private func applyPreviewRect() {
-        guard let view = self.previewView else { return }
+        guard let wrap = self.previewContainer else { return }
         guard let rect = self.previewRect, rect.width > 1, rect.height > 1 else {
-            view.isHidden = true
+            wrap.isHidden = true
             return
         }
         guard let container = self.bridge?.viewController?.view else { return }
@@ -451,14 +457,14 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             offsetX = originInContainer.x
             offsetY = originInContainer.y
         }
-        view.frame = CGRect(
+        wrap.frame = CGRect(
             x: offsetX + rect.origin.x,
             y: offsetY + rect.origin.y,
             width: rect.width,
             height: rect.height
         )
-        container.bringSubviewToFront(view)
-        view.isHidden = false
+        container.bringSubviewToFront(wrap)
+        wrap.isHidden = false
     }
 
     private var pinchBaseZoom: CGFloat = 1.0
