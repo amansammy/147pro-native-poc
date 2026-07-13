@@ -115,6 +115,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.streamW = width; self.streamH = height; self.streamFps = fps
         self.targetBitrate = bitrate; self.appliedBitrate = bitrate
         self.userStopped = false
+        self.reconnecting = false // fresh start — allow auto-reconnect to fire
         Task {
             do {
                 try await self.setupPipeline(width: width, height: height, fps: fps)
@@ -587,14 +588,23 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         var attempt = 0
         while !userStopped && attempt < 30 {
             attempt += 1
-            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3s backoff
+            try? await Task.sleep(nanoseconds: 2_500_000_000) // 2.5s backoff
             if userStopped { break }
             do {
                 await rebuildStreamObjects()
                 try await goLive()
-                reportDiag("reconnect.ok", ["attempt": attempt])
-                emit(["state": "live", "reconnected": true])
-                break
+                // YouTube accepts a freshly-created stream's connection then
+                // CLOSES it until the ingestion is provisioned (~10-20s). So a
+                // successful publish() isn't enough — verify the connection is
+                // STILL up a few seconds later before declaring success.
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                let stillUp = await (self.connection?.connected ?? false)
+                if stillUp {
+                    reportDiag("reconnect.ok", ["attempt": attempt])
+                    emit(["state": "live", "reconnected": true])
+                    break
+                }
+                reportDiag("reconnect.retry", ["attempt": attempt, "error": "closed after publish (stream not ready yet)"])
             } catch {
                 reportDiag("reconnect.retry", ["attempt": attempt, "error": error.localizedDescription])
             }
