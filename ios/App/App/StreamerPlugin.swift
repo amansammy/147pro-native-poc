@@ -64,12 +64,6 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var currentLens = "wide"
     private var currentDevice: AVCaptureDevice?
     private var observersStarted = false
-    // The capture session (camera/mic/preset) is configured ONCE. Re-attaching it
-    // while streaming resets capture and drops the live RTMP connection — the
-    // go-live freeze / YouTube "no data" bug when JS calls setupPipeline repeatedly.
-    private var captureConfigured = false
-    private var configuredWidth = 0
-    private var configuredHeight = 0
 
     // Stream params retained for auto-reconnect + thermal-adaptive bitrate.
     private var streamURL: String?
@@ -81,16 +75,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var appliedBitrate = 0
     private var userStopped = false
     private var reconnecting = false
-    // True only once the connection has been VERIFIED to hold (not just published).
-    // Gates the mid-stream reconnect so it doesn't fight the initial go-live retry.
-    private var isLive = false
-    // Polling watchdog: detects a dropped connection reliably (the RTMP status
-    // AsyncStream observer was silently not triggering the reconnect).
-    private var watchdogStarted = false
     private var overlayDiagCounter = 0
-    // The offscreen compositor's display link only starts when the mixer is
-    // running; we force it on once (see setupPipeline) and don't re-toggle.
-    private var offscreenStarted = false
 
     // MARK: - JS API
 
@@ -128,39 +113,16 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.targetBitrate = bitrate; self.appliedBitrate = bitrate
         self.userStopped = false
         self.reconnecting = false
-        self.isLive = false
         Task {
             do {
-                // Reuse the already-running preview pipeline (camera + offscreen
-                // mixer are live — the preview never freezes on connect). Then go
-                // live with a DETERMINISTIC retry loop: a freshly-created YouTube
-                // stream accepts the RTMP handshake + publish then CLOSES it
-                // (~100ms) until its ingestion is provisioned (~10-25s). So a
-                // successful publish is NOT "live" — goLiveWithRetry re-connects
-                // the same (reusable) key until the connection actually HOLDS, and
-                // only then do we report live. This replaces the flaky
-                // observer-driven reconnect for the initial connect.
+                // PROVEN club pipeline: full capture setup + DIRECT go-live. The
+                // retry/idempotency/offscreen-toggle/mixer-preview experiments
+                // regressed the framerate (60 → 0/11 fps); this is restored to the
+                // exact path that streamed true 1080p60 to YouTube at the club.
                 try await self.setupPipeline(width: width, height: height, fps: fps)
-                let live = try await self.goLiveWithRetry()
-                if live {
-                    self.isLive = true
-                    self.startObservers() // arm mid-stream drop detection + media tick
-                    self.startConnectionWatchdog() // reliable poll-based drop detection
-                    self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
-                    call.resolve()
-                } else {
-                    // userStopped (user cancelled) or exhausted attempts. Resolve on
-                    // cancel (JS bails via its usingNative guard); reject otherwise
-                    // so the UI shows an error instead of a fake "live" state.
-                    if self.userStopped {
-                        self.emit(["state": "idle"])
-                        call.resolve()
-                    } else {
-                        self.reportDiag("startStream.giveup", [:])
-                        self.emit(["state": "error", "message": "YouTube did not start ingesting the stream"])
-                        call.reject("YouTube did not start ingesting the stream in time")
-                    }
-                }
+                try await self.goLive()
+                self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
+                call.resolve()
             } catch {
                 self.reportDiag("startStream.error", ["error": error.localizedDescription, "errorFull": "\(error)"])
                 call.reject("startStream failed: \(error.localizedDescription)")
@@ -190,9 +152,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.appliedBitrate = targetBitrate
         self.reportDiag("videoSettings.applied", ["w": streamW, "h": streamH, "bitRate": targetBitrate, "profile": "H264_High_AutoLevel"])
 
-        // NOTE: observers are armed by the caller AFTER the connection is verified
-        // to hold (startStream/handleUnexpectedClose) — not here — so the initial
-        // go-live retry's expected closes don't trigger the reconnect path.
+        self.startObservers()
 
         self.reportDiag("connect.attempt", ["url": url])
         _ = try await connection.connect(url)
@@ -203,43 +163,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.reportDiag("publish.ok", ["readyState": "\(await stream.readyState)"])
     }
 
-    /// Connect + publish, retrying against the (reusable) key until the
-    /// connection actually HOLDS. Returns true once live, false if the user
-    /// stopped or attempts were exhausted. A fresh YouTube stream accepts publish
-    /// then closes ~100ms later until its ingestion is provisioned, so publish
-    /// success alone is a false positive — we recreate the RTMP objects and
-    /// re-connect the same reusable key, then verify the connection is STILL up a
-    /// few seconds later before declaring success.
-    private func goLiveWithRetry() async throws -> Bool {
-        var attempt = 0
-        while !userStopped && attempt < 30 {
-            attempt += 1
-            await rebuildStreamObjects()
-            do {
-                try await goLive()
-            } catch {
-                reportDiag("golive.retry", ["attempt": attempt, "error": error.localizedDescription])
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                continue
-            }
-            // Verify it holds — YouTube closes a not-yet-ready stream ~100ms after publish.
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            if userStopped { break }
-            if await (self.connection?.connected ?? false) {
-                reportDiag("golive.ok", ["attempt": attempt])
-                return true
-            }
-            reportDiag("golive.retry", ["attempt": attempt, "error": "closed after publish (stream not ready yet)"])
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-        }
-        return false
-    }
-
     @objc func stopStream(_ call: CAPPluginCall) {
         Task {
-            self.userStopped = true // breaks any in-flight go-live / reconnect loop
-            self.isLive = false
-            self.watchdogStarted = false
+            self.userStopped = true // breaks any in-flight reconnect loop
             await self.teardownStreamObjects()
             self.emit(["state": "idle"])
             call.resolve()
@@ -423,46 +349,40 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
-        // Configure the CAPTURE session only once (or if the resolution changes).
-        // Skipping this on repeated calls is what keeps a live stream stable when
-        // JS re-invokes setupPipeline (preview effect / go-live) — re-attaching
-        // camera/mic mid-stream was closing the RTMP connection.
-        if !captureConfigured || configuredWidth != width || configuredHeight != height {
-            _ = await AVCaptureDevice.requestAccess(for: .audio)
+        // FULL capture setup on every call — this is the PROVEN club pipeline that
+        // streamed true 1080p60. (Guarding capture behind an idempotency flag, and
+        // deferring/toggling the offscreen mode, is exactly what regressed the
+        // framerate to 0/11 fps. Re-attaching capture per setup is fine.)
+        _ = await AVCaptureDevice.requestAccess(for: .audio)
 
-            // Capture at true native res (default preset is 720p → upscaled).
-            let preset = sessionPreset(for: width, height: height)
-            await mixer.setSessionPreset(preset)
-            reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
+        // Capture at true native res (default preset is 720p → upscaled).
+        let preset = sessionPreset(for: width, height: height)
+        await mixer.setSessionPreset(preset)
+        reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
 
-            let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-            self.currentDevice = camera
-            do {
-                try await mixer.attachVideo(camera, track: 0)
-                reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
-            } catch {
-                reportDiag("attachVideo.error", ["error": error.localizedDescription])
-            }
-            if let mic = AVCaptureDevice.default(for: .audio) {
-                do {
-                    try await mixer.attachAudio(mic)
-                    reportDiag("attachAudio.ok", ["device": mic.localizedName])
-                } catch {
-                    reportDiag("attachAudio.error", ["error": error.localizedDescription])
-                }
-            } else {
-                reportDiag("attachAudio.noDevice", [:])
-            }
-
-            // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
-            await mixer.setVideoOrientation(.landscapeRight)
-            await mixer.setFrameRate(fps)
-            await setScreenSize(CGSize(width: width, height: height))
-
-            captureConfigured = true
-            configuredWidth = width
-            configuredHeight = height
+        let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        self.currentDevice = camera
+        do {
+            try await mixer.attachVideo(camera, track: 0)
+            reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
+        } catch {
+            reportDiag("attachVideo.error", ["error": error.localizedDescription])
         }
+        if let mic = AVCaptureDevice.default(for: .audio) {
+            do {
+                try await mixer.attachAudio(mic)
+                reportDiag("attachAudio.ok", ["device": mic.localizedName])
+            } catch {
+                reportDiag("attachAudio.error", ["error": error.localizedDescription])
+            }
+        } else {
+            reportDiag("attachAudio.noDevice", [:])
+        }
+
+        // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
+        await mixer.setVideoOrientation(.landscapeRight)
+        await mixer.setFrameRate(fps)
+        await setScreenSize(CGSize(width: width, height: height))
 
         // Create the RTMP objects if not already present (kept across preview→live;
         // recreated fresh after a stop).
@@ -474,38 +394,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             self.stream = stream
         }
 
-        // Start the OFFSCREEN screen compositor so the composited frame (camera +
-        // overlay) reaches BOTH the encoder and the preview via the videoTrackId
-        // == .max outputs. This is the crux bug: setVideoMixerSettings only starts
-        // the compositor's display link when the mixer is ALREADY running (see
-        // MediaMixer.setVideoRenderingMode `guard isRunning`) AND the mode actually
-        // transitions. MediaMixer starts running ASYNCHRONOUSLY after creation, so
-        // setting offscreen too early silently no-ops — the .max outputs then fall
-        // back to the raw-camera videoIO.output path: NO overlay, and a
-        // non-composited feed that starves after a few seconds (readyState→idle),
-        // which is why YouTube dropped the stream ~4s in AND the scoreboard only
-        // appeared after a later setupPipeline re-run. Fix: wait for the mixer to
-        // be running, then force a passthrough→offscreen transition so the
-        // compositor's display link actually starts. Done ONCE.
-        if !offscreenStarted {
-            var runWait = 0
-            while await mixer.isRunning == false && runWait < 60 {
-                try? await Task.sleep(nanoseconds: 50_000_000) // ≤3s, one-time at startup
-                runWait += 1
-            }
-            await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .passthrough, mainTrack: 0))
-            await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
-            let running = await mixer.isRunning
-            offscreenStarted = running
-            reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0, "isRunning": running, "runWait": runWait])
-        } else {
-            await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
-            reportDiag("videoMixer.offscreen", ["mode": "offscreen", "reassert": true])
-        }
+        // .offscreen runs the screen compositor so camera + overlay reach the encoder
+        // (in .passthrough the RTMPStream, videoTrackId == .max, gets no video).
+        await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
+        reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
 
         try await attachPreviewIfNeeded()
-        // No placeholder text — the real broadcast board arrives via updateOverlay
-        // (rendered by the web control page) on the first poll.
     }
 
     private func attachPreviewIfNeeded() async throws {
@@ -539,17 +433,14 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.previewContainer = wrap
                 self.previewView = view
             }
-            // Feed the preview from the MIXER's offscreen composite, NOT the
-            // RTMPStream. MTHKView.videoTrackId defaults to UInt8.max — the
-            // offscreen composite track (camera + overlay screen) — so the mixer
-            // delivers the SAME frame it encodes: the scoreboard shows on the
-            // preview immediately, before and independent of going live, and the
-            // preview never freezes when the RTMP connection drops or is torn
-            // down/rebuilt during reconnect. (A stream-fed preview only gets
-            // frames while publishing — the freeze + no-scoreboard bug.)
-            if let view = self.previewView {
-                await mixer.addOutput(view)
-            }
+        }
+        // Feed the preview from the STREAM (the encoder's composited feed) — the
+        // PROVEN club path. The RTMPStream is a mixer output, so the view shows the
+        // camera + overlay composite continuously (before and during publishing).
+        // Re-added every setup so a rebuilt stream (after stop/reconnect) reconnects
+        // the preview.
+        if let view = self.previewView, let stream = self.stream {
+            await stream.addOutput(view)
         }
         await self.applyPreviewRect()
     }
@@ -703,58 +594,23 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Reconnect
 
-    /// Poll the live connection every second; if it drops, kick off a reconnect.
-    /// This does NOT depend on the RTMP status AsyncStream (which was observed to
-    /// silently not fire the reconnect). One watchdog survives across reconnects
-    /// (it reads self.connection fresh each tick) and stops only on user Stop.
-    private func startConnectionWatchdog() {
-        guard !watchdogStarted else { return }
-        watchdogStarted = true
-        Task { [weak self] in
-            while true {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self else { return }
-                if self.userStopped { self.watchdogStarted = false; return }
-                guard self.isLive, !self.reconnecting else { continue }
-                let connected = await (self.connection?.connected ?? false)
-                if !connected {
-                    self.reportDiag("watchdog.drop", [:])
-                    await self.handleUnexpectedClose()
-                }
-            }
-        }
-    }
-
-    /// Fired when the RTMP connection drops unexpectedly (not a user Stop). Only
-    /// acts once we were VERIFIED live (isLive) — the initial go-live retry owns
-    /// its own expected closes, so this must not fire during it.
+    /// Fired when the RTMP connection drops unexpectedly (not a user Stop). PROVEN
+    /// club reconnect: recreate the RTMP objects and re-publish the same key.
     private func handleUnexpectedClose() async {
-        reportDiag("reconnect.trigger", ["isLive": isLive, "userStopped": userStopped, "reconnecting": reconnecting])
-        guard isLive, !userStopped, !reconnecting else { return }
+        guard !userStopped, !reconnecting else { return }
         reconnecting = true
-        isLive = false
         reportDiag("reconnect.begin", [:])
         var attempt = 0
         while !userStopped && attempt < 30 {
             attempt += 1
-            try? await Task.sleep(nanoseconds: 2_500_000_000) // 2.5s backoff
+            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3s backoff
             if userStopped { break }
             do {
                 await rebuildStreamObjects()
                 try await goLive()
-                // A freshly re-provisioned stream accepts publish then closes
-                // until ready — verify the connection is STILL up a few seconds
-                // later before declaring success.
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
-                if userStopped { break }
-                if await (self.connection?.connected ?? false) {
-                    isLive = true
-                    startObservers() // re-arm drop detection on the new connection
-                    reportDiag("reconnect.ok", ["attempt": attempt])
-                    emit(["state": "live", "reconnected": true])
-                    break
-                }
-                reportDiag("reconnect.retry", ["attempt": attempt, "error": "closed after publish (stream not ready yet)"])
+                reportDiag("reconnect.ok", ["attempt": attempt])
+                emit(["state": "live", "reconnected": true])
+                break
             } catch {
                 reportDiag("reconnect.retry", ["attempt": attempt, "error": error.localizedDescription])
             }
@@ -777,8 +633,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.connection = c
         self.stream = s
         self.observersStarted = false
-        // Preview is a MIXER output, not a stream output — it keeps running
-        // across this rebuild untouched, so no re-attach is needed here.
+        // Re-attach the stream-fed preview to the new stream.
+        if let view = self.previewView {
+            await s.addOutput(view)
+        }
     }
 
     // MARK: - Observers / diagnostics
