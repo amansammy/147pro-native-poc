@@ -88,6 +88,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     // AsyncStream observer was silently not triggering the reconnect).
     private var watchdogStarted = false
     private var overlayDiagCounter = 0
+    // The offscreen compositor's display link only starts when the mixer is
+    // running; we force it on once (see setupPipeline) and don't re-toggle.
+    private var offscreenStarted = false
 
     // MARK: - JS API
 
@@ -471,10 +474,34 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             self.stream = stream
         }
 
-        // .offscreen runs the screen compositor so camera + overlay reach the encoder
-        // (in .passthrough the RTMPStream, videoTrackId == .max, gets no video).
-        await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
-        reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
+        // Start the OFFSCREEN screen compositor so the composited frame (camera +
+        // overlay) reaches BOTH the encoder and the preview via the videoTrackId
+        // == .max outputs. This is the crux bug: setVideoMixerSettings only starts
+        // the compositor's display link when the mixer is ALREADY running (see
+        // MediaMixer.setVideoRenderingMode `guard isRunning`) AND the mode actually
+        // transitions. MediaMixer starts running ASYNCHRONOUSLY after creation, so
+        // setting offscreen too early silently no-ops — the .max outputs then fall
+        // back to the raw-camera videoIO.output path: NO overlay, and a
+        // non-composited feed that starves after a few seconds (readyState→idle),
+        // which is why YouTube dropped the stream ~4s in AND the scoreboard only
+        // appeared after a later setupPipeline re-run. Fix: wait for the mixer to
+        // be running, then force a passthrough→offscreen transition so the
+        // compositor's display link actually starts. Done ONCE.
+        if !offscreenStarted {
+            var runWait = 0
+            while await mixer.isRunning == false && runWait < 60 {
+                try? await Task.sleep(nanoseconds: 50_000_000) // ≤3s, one-time at startup
+                runWait += 1
+            }
+            await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .passthrough, mainTrack: 0))
+            await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
+            let running = await mixer.isRunning
+            offscreenStarted = running
+            reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0, "isRunning": running, "runWait": runWait])
+        } else {
+            await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
+            reportDiag("videoMixer.offscreen", ["mode": "offscreen", "reassert": true])
+        }
 
         try await attachPreviewIfNeeded()
         // No placeholder text — the real broadcast board arrives via updateOverlay
