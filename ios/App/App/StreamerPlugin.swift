@@ -84,6 +84,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     // True only once the connection has been VERIFIED to hold (not just published).
     // Gates the mid-stream reconnect so it doesn't fight the initial go-live retry.
     private var isLive = false
+    // Polling watchdog: detects a dropped connection reliably (the RTMP status
+    // AsyncStream observer was silently not triggering the reconnect).
+    private var watchdogStarted = false
+    private var overlayDiagCounter = 0
 
     // MARK: - JS API
 
@@ -138,6 +142,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 if live {
                     self.isLive = true
                     self.startObservers() // arm mid-stream drop detection + media tick
+                    self.startConnectionWatchdog() // reliable poll-based drop detection
                     self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
                     call.resolve()
                 } else {
@@ -231,6 +236,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         Task {
             self.userStopped = true // breaks any in-flight go-live / reconnect loop
             self.isLive = false
+            self.watchdogStarted = false
             await self.teardownStreamObjects()
             self.emit(["state": "idle"])
             call.resolve()
@@ -299,6 +305,21 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             }
         }
         overlayImage?.cgImage = cg
+        // Periodically report the overlay's live geometry so we can see on-device
+        // whether it's actually in the composite with valid bounds (the scoreboard
+        // renders into the same buffer the encoder sends AND the preview shows).
+        overlayDiagCounter += 1
+        if overlayDiagCounter % 8 == 1 {
+            let b = overlayImage?.bounds ?? .zero
+            let vis = overlayImage?.isVisible ?? false
+            let ss = mixer.screen.size
+            reportDiag("overlay.geom", [
+                "boundsW": Double(b.width), "boundsH": Double(b.height),
+                "boundsX": Double(b.origin.x), "boundsY": Double(b.origin.y),
+                "visible": vis,
+                "screenW": Double(ss.width), "screenH": Double(ss.height)
+            ])
+        }
         return true
     }
 
@@ -655,10 +676,33 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Reconnect
 
+    /// Poll the live connection every second; if it drops, kick off a reconnect.
+    /// This does NOT depend on the RTMP status AsyncStream (which was observed to
+    /// silently not fire the reconnect). One watchdog survives across reconnects
+    /// (it reads self.connection fresh each tick) and stops only on user Stop.
+    private func startConnectionWatchdog() {
+        guard !watchdogStarted else { return }
+        watchdogStarted = true
+        Task { [weak self] in
+            while true {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self else { return }
+                if self.userStopped { self.watchdogStarted = false; return }
+                guard self.isLive, !self.reconnecting else { continue }
+                let connected = await (self.connection?.connected ?? false)
+                if !connected {
+                    self.reportDiag("watchdog.drop", [:])
+                    await self.handleUnexpectedClose()
+                }
+            }
+        }
+    }
+
     /// Fired when the RTMP connection drops unexpectedly (not a user Stop). Only
     /// acts once we were VERIFIED live (isLive) — the initial go-live retry owns
     /// its own expected closes, so this must not fire during it.
     private func handleUnexpectedClose() async {
+        reportDiag("reconnect.trigger", ["isLive": isLive, "userStopped": userStopped, "reconnecting": reconnecting])
         guard isLive, !userStopped, !reconnecting else { return }
         reconnecting = true
         isLive = false
