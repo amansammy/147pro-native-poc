@@ -121,6 +121,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.reconnecting = false // fresh start — allow auto-reconnect to fire
         Task {
             do {
+                // Go live with a FULLY FRESH capture + RTMP setup (this is the
+                // proven Custom-RTMP path). Reusing the preview's idle pipeline
+                // left the encoder producing 0 fps (YouTube then closes the
+                // connection). Tear the RTMP objects down and force the capture
+                // to re-attach so live frames flow into the encoder.
+                await self.teardownStreamObjects()
+                self.captureConfigured = false
                 try await self.setupPipeline(width: width, height: height, fps: fps)
                 try await self.goLive()
                 self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
