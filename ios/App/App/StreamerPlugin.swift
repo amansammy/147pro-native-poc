@@ -70,7 +70,6 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var captureConfigured = false
     private var configuredWidth = 0
     private var configuredHeight = 0
-    private var previewAddedToStream = false
 
     // Stream params retained for auto-reconnect + thermal-adaptive bitrate.
     private var streamURL: String?
@@ -121,13 +120,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.reconnecting = false // fresh start — allow auto-reconnect to fire
         Task {
             do {
-                // Go live with a FULLY FRESH capture + RTMP setup (this is the
-                // proven Custom-RTMP path). Reusing the preview's idle pipeline
-                // left the encoder producing 0 fps (YouTube then closes the
-                // connection). Tear the RTMP objects down and force the capture
-                // to re-attach so live frames flow into the encoder.
-                await self.teardownStreamObjects()
-                self.captureConfigured = false
+                // Reuse the already-running preview pipeline (camera + offscreen
+                // mixer are live). Going live just ensures the RTMP objects exist
+                // and publishes — the mixer keeps feeding BOTH the encoder and the
+                // preview, so the preview never freezes on connect. (The earlier
+                // "fresh capture" teardown here chased a 0-fps red herring; the
+                // real go-live failure was a non-reusable YouTube stream key,
+                // fixed server-side with isReusable:true.)
                 try await self.setupPipeline(width: width, height: height, fps: fps)
                 try await self.goLive()
                 self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
@@ -392,7 +391,6 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             await mixer.addOutput(stream)
             self.connection = connection
             self.stream = stream
-            self.previewAddedToStream = false // new stream needs the preview re-attached
         }
 
         // .offscreen runs the screen compositor so camera + overlay reach the encoder
@@ -436,10 +434,17 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.previewContainer = wrap
                 self.previewView = view
             }
-        }
-        if let view = previewView, let stream = self.stream, !previewAddedToStream {
-            await stream.addOutput(view)
-            previewAddedToStream = true
+            // Feed the preview from the MIXER's offscreen composite, NOT the
+            // RTMPStream. MTHKView.videoTrackId defaults to UInt8.max — the
+            // offscreen composite track (camera + overlay screen) — so the mixer
+            // delivers the SAME frame it encodes: the scoreboard shows on the
+            // preview immediately, before and independent of going live, and the
+            // preview never freezes when the RTMP connection drops or is torn
+            // down/rebuilt during reconnect. (A stream-fed preview only gets
+            // frames while publishing — the freeze + no-scoreboard bug.)
+            if let view = self.previewView {
+                await mixer.addOutput(view)
+            }
         }
         await self.applyPreviewRect()
     }
@@ -640,9 +645,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.connection = c
         self.stream = s
         self.observersStarted = false
-        if let view = self.previewView {
-            await s.addOutput(view)
-        }
+        // Preview is a MIXER output, not a stream output — it keeps running
+        // across this rebuild untouched, so no re-attach is needed here.
     }
 
     // MARK: - Observers / diagnostics
