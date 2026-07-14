@@ -81,6 +81,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var appliedBitrate = 0
     private var userStopped = false
     private var reconnecting = false
+    // True only once the connection has been VERIFIED to hold (not just published).
+    // Gates the mid-stream reconnect so it doesn't fight the initial go-live retry.
+    private var isLive = false
 
     // MARK: - JS API
 
@@ -117,20 +120,39 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.streamW = width; self.streamH = height; self.streamFps = fps
         self.targetBitrate = bitrate; self.appliedBitrate = bitrate
         self.userStopped = false
-        self.reconnecting = false // fresh start — allow auto-reconnect to fire
+        self.reconnecting = false
+        self.isLive = false
         Task {
             do {
                 // Reuse the already-running preview pipeline (camera + offscreen
-                // mixer are live). Going live just ensures the RTMP objects exist
-                // and publishes — the mixer keeps feeding BOTH the encoder and the
-                // preview, so the preview never freezes on connect. (The earlier
-                // "fresh capture" teardown here chased a 0-fps red herring; the
-                // real go-live failure was a non-reusable YouTube stream key,
-                // fixed server-side with isReusable:true.)
+                // mixer are live — the preview never freezes on connect). Then go
+                // live with a DETERMINISTIC retry loop: a freshly-created YouTube
+                // stream accepts the RTMP handshake + publish then CLOSES it
+                // (~100ms) until its ingestion is provisioned (~10-25s). So a
+                // successful publish is NOT "live" — goLiveWithRetry re-connects
+                // the same (reusable) key until the connection actually HOLDS, and
+                // only then do we report live. This replaces the flaky
+                // observer-driven reconnect for the initial connect.
                 try await self.setupPipeline(width: width, height: height, fps: fps)
-                try await self.goLive()
-                self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
-                call.resolve()
+                let live = try await self.goLiveWithRetry()
+                if live {
+                    self.isLive = true
+                    self.startObservers() // arm mid-stream drop detection + media tick
+                    self.emit(["state": "live", "width": width, "height": height, "fps": Int(fps), "bitrate": bitrate])
+                    call.resolve()
+                } else {
+                    // userStopped (user cancelled) or exhausted attempts. Resolve on
+                    // cancel (JS bails via its usingNative guard); reject otherwise
+                    // so the UI shows an error instead of a fake "live" state.
+                    if self.userStopped {
+                        self.emit(["state": "idle"])
+                        call.resolve()
+                    } else {
+                        self.reportDiag("startStream.giveup", [:])
+                        self.emit(["state": "error", "message": "YouTube did not start ingesting the stream"])
+                        call.reject("YouTube did not start ingesting the stream in time")
+                    }
+                }
             } catch {
                 self.reportDiag("startStream.error", ["error": error.localizedDescription, "errorFull": "\(error)"])
                 call.reject("startStream failed: \(error.localizedDescription)")
@@ -160,7 +182,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.appliedBitrate = targetBitrate
         self.reportDiag("videoSettings.applied", ["w": streamW, "h": streamH, "bitRate": targetBitrate, "profile": "H264_High_AutoLevel"])
 
-        self.startObservers()
+        // NOTE: observers are armed by the caller AFTER the connection is verified
+        // to hold (startStream/handleUnexpectedClose) — not here — so the initial
+        // go-live retry's expected closes don't trigger the reconnect path.
 
         self.reportDiag("connect.attempt", ["url": url])
         _ = try await connection.connect(url)
@@ -171,9 +195,42 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.reportDiag("publish.ok", ["readyState": "\(await stream.readyState)"])
     }
 
+    /// Connect + publish, retrying against the (reusable) key until the
+    /// connection actually HOLDS. Returns true once live, false if the user
+    /// stopped or attempts were exhausted. A fresh YouTube stream accepts publish
+    /// then closes ~100ms later until its ingestion is provisioned, so publish
+    /// success alone is a false positive — we recreate the RTMP objects and
+    /// re-connect the same reusable key, then verify the connection is STILL up a
+    /// few seconds later before declaring success.
+    private func goLiveWithRetry() async throws -> Bool {
+        var attempt = 0
+        while !userStopped && attempt < 30 {
+            attempt += 1
+            await rebuildStreamObjects()
+            do {
+                try await goLive()
+            } catch {
+                reportDiag("golive.retry", ["attempt": attempt, "error": error.localizedDescription])
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                continue
+            }
+            // Verify it holds — YouTube closes a not-yet-ready stream ~100ms after publish.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            if userStopped { break }
+            if await (self.connection?.connected ?? false) {
+                reportDiag("golive.ok", ["attempt": attempt])
+                return true
+            }
+            reportDiag("golive.retry", ["attempt": attempt, "error": "closed after publish (stream not ready yet)"])
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+        }
+        return false
+    }
+
     @objc func stopStream(_ call: CAPPluginCall) {
         Task {
-            self.userStopped = true
+            self.userStopped = true // breaks any in-flight go-live / reconnect loop
+            self.isLive = false
             await self.teardownStreamObjects()
             self.emit(["state": "idle"])
             call.resolve()
@@ -598,10 +655,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Reconnect
 
-    /// Fired when the RTMP connection drops unexpectedly (not a user Stop).
+    /// Fired when the RTMP connection drops unexpectedly (not a user Stop). Only
+    /// acts once we were VERIFIED live (isLive) — the initial go-live retry owns
+    /// its own expected closes, so this must not fire during it.
     private func handleUnexpectedClose() async {
-        guard !userStopped, !reconnecting else { return }
+        guard isLive, !userStopped, !reconnecting else { return }
         reconnecting = true
+        isLive = false
         reportDiag("reconnect.begin", [:])
         var attempt = 0
         while !userStopped && attempt < 30 {
@@ -611,13 +671,14 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             do {
                 await rebuildStreamObjects()
                 try await goLive()
-                // YouTube accepts a freshly-created stream's connection then
-                // CLOSES it until the ingestion is provisioned (~10-20s). So a
-                // successful publish() isn't enough — verify the connection is
-                // STILL up a few seconds later before declaring success.
+                // A freshly re-provisioned stream accepts publish then closes
+                // until ready — verify the connection is STILL up a few seconds
+                // later before declaring success.
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
-                let stillUp = await (self.connection?.connected ?? false)
-                if stillUp {
+                if userStopped { break }
+                if await (self.connection?.connected ?? false) {
+                    isLive = true
+                    startObservers() // re-arm drop detection on the new connection
                     reportDiag("reconnect.ok", ["attempt": attempt])
                     emit(["state": "live", "reconnected": true])
                     break
