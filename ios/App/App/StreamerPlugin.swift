@@ -76,6 +76,15 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var userStopped = false
     private var reconnecting = false
     private var overlayDiagCounter = 0
+    // The real app's React effects call startPreview repeatedly (~4x/sec); doing a
+    // FULL capture re-setup on each thrashes the camera and starves the encoder.
+    // So the CAPTURE session (preset/camera/mic/orientation/fps) is configured
+    // once (or when the resolution changes). Everything else in setupPipeline
+    // (offscreen mode, RTMP objects, preview attach) stays club-identical and is
+    // idempotent on repeat, so churn becomes cheap no-ops.
+    private var captureConfigured = false
+    private var configuredWidth = 0
+    private var configuredHeight = 0
 
     // MARK: - JS API
 
@@ -349,40 +358,48 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
-        // FULL capture setup on every call — this is the PROVEN club pipeline that
-        // streamed true 1080p60. (Guarding capture behind an idempotency flag, and
-        // deferring/toggling the offscreen mode, is exactly what regressed the
-        // framerate to 0/11 fps. Re-attaching capture per setup is fine.)
-        _ = await AVCaptureDevice.requestAccess(for: .audio)
+        // CAPTURE setup runs ONCE (or when the resolution changes). This is the ONLY
+        // guard vs the club version — the real app's React effects churn
+        // startPreview ~4x/sec, and a full capture re-attach on each call thrashes
+        // the camera and starves the encoder (the 11fps / hung-preview bug).
+        // Everything below (RTMP objects, single offscreen mode, stream-fed preview)
+        // is club-exact and idempotent, so the churn becomes cheap no-ops.
+        if !captureConfigured || configuredWidth != width || configuredHeight != height {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
 
-        // Capture at true native res (default preset is 720p → upscaled).
-        let preset = sessionPreset(for: width, height: height)
-        await mixer.setSessionPreset(preset)
-        reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
+            // Capture at true native res (default preset is 720p → upscaled).
+            let preset = sessionPreset(for: width, height: height)
+            await mixer.setSessionPreset(preset)
+            reportDiag("sessionPreset.set", ["preset": "\(preset.rawValue)", "w": width, "h": height])
 
-        let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
-        self.currentDevice = camera
-        do {
-            try await mixer.attachVideo(camera, track: 0)
-            reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
-        } catch {
-            reportDiag("attachVideo.error", ["error": error.localizedDescription])
-        }
-        if let mic = AVCaptureDevice.default(for: .audio) {
+            let camera = cameraDevice(for: currentLens) ?? AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+            self.currentDevice = camera
             do {
-                try await mixer.attachAudio(mic)
-                reportDiag("attachAudio.ok", ["device": mic.localizedName])
+                try await mixer.attachVideo(camera, track: 0)
+                reportDiag("attachVideo.ok", ["lens": currentLens, "device": camera?.localizedName ?? "nil"])
             } catch {
-                reportDiag("attachAudio.error", ["error": error.localizedDescription])
+                reportDiag("attachVideo.error", ["error": error.localizedDescription])
             }
-        } else {
-            reportDiag("attachAudio.noDevice", [:])
-        }
+            if let mic = AVCaptureDevice.default(for: .audio) {
+                do {
+                    try await mixer.attachAudio(mic)
+                    reportDiag("attachAudio.ok", ["device": mic.localizedName])
+                } catch {
+                    reportDiag("attachAudio.error", ["error": error.localizedDescription])
+                }
+            } else {
+                reportDiag("attachAudio.noDevice", [:])
+            }
 
-        // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
-        await mixer.setVideoOrientation(.landscapeRight)
-        await mixer.setFrameRate(fps)
-        await setScreenSize(CGSize(width: width, height: height))
+            // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
+            await mixer.setVideoOrientation(.landscapeRight)
+            await mixer.setFrameRate(fps)
+            await setScreenSize(CGSize(width: width, height: height))
+
+            captureConfigured = true
+            configuredWidth = width
+            configuredHeight = height
+        }
 
         // Create the RTMP objects if not already present (kept across preview→live;
         // recreated fresh after a stop).
