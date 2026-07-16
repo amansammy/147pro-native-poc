@@ -17,6 +17,13 @@ class MainViewController: CAPBridgeViewController {
     override open func capacitorDidLoad() {
         bridge?.registerPluginInstance(StreamerPlugin())
 
+        // StoreKit 2 in-app purchase (Pro upgrade). iOS 15+ only; on older iOS the
+        // web app keeps the (unavailable-in-app) Stripe path. registerPluginInstance
+        // injects the JS proxy at Capacitor.Plugins.Iap for the plain-HTML front end.
+        if #available(iOS 15.0, *) {
+            bridge?.registerPluginInstance(IapPlugin())
+        }
+
         // Edge-swipe back/forward (the Appilix app had this; Capacitor doesn't
         // enable it by default). The SPA uses the history API, so WKWebView's
         // back-forward gestures navigate app routes as expected.

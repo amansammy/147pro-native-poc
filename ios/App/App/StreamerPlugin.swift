@@ -65,6 +65,11 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var currentLens = "wide"
     private var currentDevice: AVCaptureDevice?
     private var observersStarted = false
+    // Live camera orientation. The phone can be held in EITHER landscape; we track
+    // the physical device orientation and re-orient capture so the video stays
+    // upright both ways (fixes upside-down when the power button faces down).
+    private var orientationObserver: NSObjectProtocol?
+    private var lastVideoOrientation: AVCaptureVideoOrientation = .landscapeRight
 
     // Stream params retained for auto-reconnect + thermal-adaptive bitrate.
     private var streamURL: String?
@@ -370,6 +375,44 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    // MARK: - Orientation
+
+    /// Map the PHYSICAL device orientation to the capture orientation that keeps
+    /// the video upright. The landscape mapping is INVERTED — a well-known
+    /// AVFoundation quirk: deviceLandscapeLeft → captureLandscapeRight and
+    /// deviceLandscapeRight → captureLandscapeLeft. Flat/unknown keeps the last
+    /// known orientation so laying the phone down doesn't flip the frame.
+    private func videoOrientationForCurrentDevice() -> AVCaptureVideoOrientation {
+        switch UIDevice.current.orientation {
+        case .landscapeLeft: return .landscapeRight
+        case .landscapeRight: return .landscapeLeft
+        case .portrait: return .portrait
+        case .portraitUpsideDown: return .portraitUpsideDown
+        default: return self.lastVideoOrientation
+        }
+    }
+
+    /// Start observing device rotation so flipping between the two landscape
+    /// orientations re-orients the camera live (both the preview and the encoded
+    /// stream, since both come from the same mixer). Registered once, on main.
+    @MainActor
+    private func startOrientationUpdates() {
+        guard orientationObserver == nil else { return }
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        orientationObserver = NotificationCenter.default.addObserver(
+            forName: UIDevice.orientationDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let vo = self.videoOrientationForCurrentDevice()
+            guard vo != self.lastVideoOrientation else { return }
+            self.lastVideoOrientation = vo
+            self.reportDiag("orientation.change", ["vo": vo.rawValue])
+            Task { await self.mixer.setVideoOrientation(vo) }
+        }
+    }
+
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
@@ -406,8 +449,14 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 reportDiag("attachAudio.noDevice", [:])
             }
 
-            // Landscape capture (matches the 16:9 encoder + a snooker/pool stream).
-            await mixer.setVideoOrientation(.landscapeRight)
+            // Landscape capture (16:9 encoder). Honor BOTH landscape orientations
+            // (the phone can be held either way) and keep re-orienting on rotation.
+            let vo: AVCaptureVideoOrientation = await MainActor.run {
+                self.startOrientationUpdates()
+                return self.videoOrientationForCurrentDevice()
+            }
+            self.lastVideoOrientation = vo
+            await mixer.setVideoOrientation(vo)
             await mixer.setFrameRate(fps)
             await setScreenSize(CGSize(width: width, height: height))
 
