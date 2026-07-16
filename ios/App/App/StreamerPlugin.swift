@@ -355,6 +355,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private func setScreenSlideOffset(_ y: CGFloat) {
         screenLayer?.isVisible = true
         screenLayer?.layoutMargin = .init(top: y, left: 0, bottom: 0, right: 0)
+        // Mutating layoutMargin does NOT flag a re-layout on its own (only size /
+        // cgImage / invalidateLayout do), so without this the bounds stay stale and
+        // the image pops instead of sliding.
+        screenLayer?.invalidateLayout()
     }
 
     @ScreenActor
@@ -766,6 +770,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private func setScreenSize(_ size: CGSize) {
         mixer.screen.size = size
         ensureOverlayLayers()
+        // The screen layer needs an EXPLICIT full-frame size. With size == .zero a
+        // ScreenObject auto-sizes to (parent − layoutMargin), so a negative top
+        // margin would inflate its height instead of translating it — breaking the
+        // slide. A fixed size makes layoutMargin.top a pure vertical translate.
+        // (board/top keep size == .zero so they fill the frame at margin 0.)
+        screenLayer?.size = size
     }
 
     private func sessionPreset(for width: Int, height: Int) -> AVCaptureSession.Preset {
