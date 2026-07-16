@@ -451,13 +451,16 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 self.previewView = view
             }
         }
-        // Feed the preview from the STREAM (the encoder's composited feed) — the
-        // PROVEN club path. The RTMPStream is a mixer output, so the view shows the
-        // camera + overlay composite continuously (before and during publishing).
-        // Re-added every setup so a rebuilt stream (after stop/reconnect) reconnects
-        // the preview.
-        if let view = self.previewView, let stream = self.stream {
-            await stream.addOutput(view)
+        // Feed the preview from the MIXER's offscreen composite (camera + overlay),
+        // NOT the RTMPStream. The stream (a separate mixer output) is untouched, so
+        // streaming is unaffected — but the view now gets the composite CONTINUOUSLY,
+        // independent of publishing. So the scoreboard shows on the preview before
+        // going live, survives Stop, and updates live when the board changes (a
+        // stream-fed preview only rendered while actively publishing). MTHKView's
+        // videoTrackId defaults to UInt8.max — the offscreen composite track — and
+        // mixer.addOutput is idempotent, so calling it each setup is safe.
+        if let view = self.previewView {
+            await mixer.addOutput(view)
         }
         await self.applyPreviewRect()
     }
@@ -650,10 +653,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         self.connection = c
         self.stream = s
         self.observersStarted = false
-        // Re-attach the stream-fed preview to the new stream.
-        if let view = self.previewView {
-            await s.addOutput(view)
-        }
+        // Preview is a MIXER output now — it keeps running across this stream
+        // rebuild untouched, so there's nothing to re-attach here.
     }
 
     // MARK: - Observers / diagnostics
