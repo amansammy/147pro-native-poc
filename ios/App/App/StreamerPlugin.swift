@@ -110,6 +110,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var captureConfigured = false
     private var configuredWidth = 0
     private var configuredHeight = 0
+    // Applied capture frame rate. Tracked separately from the capture guard (which
+    // only keys on resolution) so an fps change (e.g. picking 1080p60 after the
+    // preview already started at 30) actually re-applies.
+    private var configuredFps: Double = 0
 
     // MARK: - JS API
 
@@ -587,12 +591,22 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 reportDiag("attachAudio.noDevice", [:])
             }
 
-            await mixer.setFrameRate(fps)
             await setScreenSize(CGSize(width: width, height: height))
 
             captureConfigured = true
             configuredWidth = width
             configuredHeight = height
+        }
+
+        // Apply the frame rate whenever it CHANGES — NOT gated by captureConfigured.
+        // The preview starts once (guarded) at whatever fps was selected then; if
+        // the user later picks 1080p60, or go-live requests 60, the capture guard
+        // above is skipped (same resolution) so the fps would otherwise never
+        // update. setFrameRate re-selects a 60-capable activeFormat as needed.
+        if fps != configuredFps {
+            await mixer.setFrameRate(fps)
+            configuredFps = fps
+            reportDiag("frameRate.set", ["fps": fps])
         }
 
         // Create the RTMP objects if not already present (kept across preview→live;
