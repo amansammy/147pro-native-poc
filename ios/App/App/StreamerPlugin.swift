@@ -904,6 +904,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         // Media-flow tick: runs until the connection drops. Also applies
         // thermal-adaptive bitrate (throttle when hot, restore when cool).
         let tickStream = stream
+        let tickStart = Date()
         Task { [weak self] in
             while true {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -924,8 +925,19 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                     self.reportDiag("bitrate.adapt", ["bitRate": desired, "thermal": self.thermalStateString()])
                 }
 
+                // Capture-side target fps (from the device's min frame duration) — if
+                // this stays 60 but stream fps drops, the ENCODER/compositor is the
+                // bottleneck; if it drops too, the CAPTURE was throttled. memMB rules
+                // out a leak; elapsedSec lets us plot the drop over time.
+                var camTargetFps = 0
+                if let dur = self.currentDevice?.activeVideoMinFrameDuration, dur.seconds > 0 {
+                    camTargetFps = Int((1.0 / dur.seconds).rounded())
+                }
                 self.reportDiag("media.tick", [
                     "fps": Int(fps),
+                    "elapsedSec": Int(Date().timeIntervalSince(tickStart)),
+                    "camTargetFps": camTargetFps,
+                    "memMB": self.residentMemoryMB(),
                     "readyState": "\(ready)",
                     "connected": connected,
                     "byteCount": info.byteCount,
@@ -938,12 +950,27 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    // Master switch for the network diagnostics. OFF by default: the per-frame
-    // POST to /_api/stream-diag was a heavy hot-path drain (heat/battery/radio,
-    // and it hammered prod). `emit` still runs so the JS side keeps getting
-    // `media.tick` — that's what drives the live bitrate/fps indicator. Flip to
-    // true only for a debugging session.
-    private static let debugDiagnosticsEnabled = false
+    /// Physical memory footprint (MB) — the figure iOS uses for jetsam. Growing
+    /// steadily over a stream would indicate a leak (e.g. overlay CGImages not
+    /// released) rather than thermal throttling.
+    private func residentMemoryMB() -> Int {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) / 4
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return -1 }
+        return Int(info.phys_footprint / (1024 * 1024))
+    }
+
+    // Master switch for the network diagnostics. Currently ON to investigate the
+    // 1080p60 fps drop after ~2-3 min. The heavy per-overlay-frame POST is gone
+    // (the layered path doesn't diag per push), so what POSTs now is low-volume:
+    // mostly one-time setup events + media.tick every 2s (fps/thermal/mem/elapsed).
+    // Set back to false once the fps drop is diagnosed + fixed.
+    private static let debugDiagnosticsEnabled = true
 
     private func reportDiag(_ event: String, _ extra: [String: Any]) {
         var dict: [String: Any] = [
