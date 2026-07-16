@@ -30,6 +30,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setPreviewRect", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setMuted", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "startOAuth", returnType: CAPPluginReturnPromise)
     ]
 
@@ -352,6 +353,20 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         } catch {
             self.reportDiag("focusExposure.error", ["error": error.localizedDescription])
             call.reject("focus/exposure lock failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Mute/unmute the microphone in the encoded stream. Uses the audio mixer's
+    /// isMuted flag (keeps the mic attached — no track drop/glitch), so YouTube
+    /// gets silence while muted and audio resumes cleanly on unmute.
+    @objc func setMuted(_ call: CAPPluginCall) {
+        let muted = call.getBool("muted") ?? false
+        Task {
+            var settings = await mixer.audioMixerSettings
+            settings.isMuted = muted
+            await mixer.setAudioMixerSettings(settings)
+            self.reportDiag("audio.muted", ["muted": muted])
+            call.resolve(["muted": muted])
         }
     }
 
