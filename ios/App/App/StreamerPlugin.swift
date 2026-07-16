@@ -65,11 +65,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var currentLens = "wide"
     private var currentDevice: AVCaptureDevice?
     private var observersStarted = false
-    // Live camera orientation. The phone can be held in EITHER landscape; we track
-    // the physical device orientation and re-orient capture so the video stays
-    // upright both ways (fixes upside-down when the power button faces down).
-    private var orientationObserver: NSObjectProtocol?
+    // Live camera orientation. The phone can be held in EITHER landscape; we read
+    // the INTERFACE orientation (the app supports both landscapes, so the UI
+    // follows the device and this is valid immediately) and re-orient capture so
+    // the video stays upright both ways (fixes upside-down with power button down).
     private var lastVideoOrientation: AVCaptureVideoOrientation = .landscapeRight
+    private var videoOrientationApplied = false
 
     // Stream params retained for auto-reconnect + thermal-adaptive bitrate.
     private var streamURL: String?
@@ -377,40 +378,35 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // MARK: - Orientation
 
-    /// Map the PHYSICAL device orientation to the capture orientation that keeps
-    /// the video upright. The landscape mapping is INVERTED — a well-known
-    /// AVFoundation quirk: deviceLandscapeLeft → captureLandscapeRight and
-    /// deviceLandscapeRight → captureLandscapeLeft. Flat/unknown keeps the last
-    /// known orientation so laying the phone down doesn't flip the frame.
-    private func videoOrientationForCurrentDevice() -> AVCaptureVideoOrientation {
-        switch UIDevice.current.orientation {
-        case .landscapeLeft: return .landscapeRight
-        case .landscapeRight: return .landscapeLeft
-        case .portrait: return .portrait
-        case .portraitUpsideDown: return .portraitUpsideDown
+    /// The capture orientation for the current INTERFACE orientation. Apple's
+    /// authoritative direct mapping (see the AVCam sample): interface and capture
+    /// use the same physical convention, so no inversion. Immediately valid
+    /// (unlike UIDevice.orientation, which is `.unknown` until motion updates run
+    /// and stays stale if the phone doesn't move — that's why the first attempt
+    /// failed for a phone already sitting in the "power button down" landscape).
+    @MainActor
+    private func interfaceVideoOrientation() -> AVCaptureVideoOrientation {
+        let io = self.bridge?.viewController?.view.window?.windowScene?.interfaceOrientation
+        switch io {
+        case .some(.portrait): return .portrait
+        case .some(.portraitUpsideDown): return .portraitUpsideDown
+        case .some(.landscapeLeft): return .landscapeLeft
+        case .some(.landscapeRight): return .landscapeRight
         default: return self.lastVideoOrientation
         }
     }
 
-    /// Start observing device rotation so flipping between the two landscape
-    /// orientations re-orients the camera live (both the preview and the encoded
-    /// stream, since both come from the same mixer). Registered once, on main.
-    @MainActor
-    private func startOrientationUpdates() {
-        guard orientationObserver == nil else { return }
-        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
-        orientationObserver = NotificationCenter.default.addObserver(
-            forName: UIDevice.orientationDidChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            let vo = self.videoOrientationForCurrentDevice()
-            guard vo != self.lastVideoOrientation else { return }
-            self.lastVideoOrientation = vo
-            self.reportDiag("orientation.change", ["vo": vo.rawValue])
-            Task { await self.mixer.setVideoOrientation(vo) }
-        }
+    /// Apply the current interface orientation to the capture (both preview and
+    /// stream come from the same mixer, so this fixes both). Called on setup AND
+    /// on every setPreviewRect — the web re-reports the rect in a burst on
+    /// `orientationchange`, so a rotation re-orients within that burst without a
+    /// separate motion observer. Guarded so the mixer call fires only on a change.
+    private func applyCurrentVideoOrientation() async {
+        let vo = await MainActor.run { self.interfaceVideoOrientation() }
+        guard !self.videoOrientationApplied || vo != self.lastVideoOrientation else { return }
+        self.videoOrientationApplied = true
+        self.lastVideoOrientation = vo
+        await mixer.setVideoOrientation(vo)
     }
 
     // MARK: - Pipeline
@@ -449,14 +445,6 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 reportDiag("attachAudio.noDevice", [:])
             }
 
-            // Landscape capture (16:9 encoder). Honor BOTH landscape orientations
-            // (the phone can be held either way) and keep re-orienting on rotation.
-            let vo: AVCaptureVideoOrientation = await MainActor.run {
-                self.startOrientationUpdates()
-                return self.videoOrientationForCurrentDevice()
-            }
-            self.lastVideoOrientation = vo
-            await mixer.setVideoOrientation(vo)
             await mixer.setFrameRate(fps)
             await setScreenSize(CGSize(width: width, height: height))
 
@@ -479,6 +467,11 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         // (in .passthrough the RTMPStream, videoTrackId == .max, gets no video).
         await mixer.setVideoMixerSettings(VideoMixerSettings(mode: .offscreen, mainTrack: 0))
         reportDiag("videoMixer.offscreen", ["mode": "offscreen", "mainTrack": 0])
+
+        // Orient capture to the current interface orientation (outside the capture
+        // guard so it re-applies as setupPipeline is re-invoked, e.g. after a
+        // rotation). Guarded internally so the mixer call only fires on a change.
+        await applyCurrentVideoOrientation()
 
         try await attachPreviewIfNeeded()
     }
@@ -622,8 +615,11 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         let w = CGFloat(call.getDouble("width") ?? 0)
         let h = CGFloat(call.getDouble("height") ?? 0)
         self.previewRect = CGRect(x: x, y: y, width: w, height: h)
-        Task { @MainActor in
-            self.applyPreviewRect()
+        Task {
+            await MainActor.run { self.applyPreviewRect() }
+            // Re-orient on rotation: the web fires a burst of setPreviewRect calls
+            // on orientationchange, so re-check the interface orientation here.
+            await self.applyCurrentVideoOrientation()
             call.resolve()
         }
     }
@@ -779,6 +775,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    // Master switch for the network diagnostics. OFF by default: the per-frame
+    // POST to /_api/stream-diag was a heavy hot-path drain (heat/battery/radio,
+    // and it hammered prod). `emit` still runs so the JS side keeps getting
+    // `media.tick` — that's what drives the live bitrate/fps indicator. Flip to
+    // true only for a debugging session.
+    private static let debugDiagnosticsEnabled = false
+
     private func reportDiag(_ event: String, _ extra: [String: Any]) {
         var dict: [String: Any] = [
             "kind": "native-stream-diag",
@@ -786,7 +789,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             "t": ISO8601DateFormatter().string(from: Date())
         ]
         for (k, v) in extra { dict[k] = v }
+        // Keep emitting to JS (media.tick → bitrate indicator); only the network
+        // POST is gated off.
         emit(dict)
+        guard Self.debugDiagnosticsEnabled else { return }
         guard let url = URL(string: "https://app.147pro.com/_api/stream-diag"),
               let body = try? JSONSerialization.data(withJSONObject: dict) else { return }
         var req = URLRequest(url: url)
