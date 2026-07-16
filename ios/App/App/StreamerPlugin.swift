@@ -27,6 +27,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "setLens", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "updateOverlay", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setBoardOverlay", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setTopOverlay", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setScreen", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "animateScreen", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setPreviewRect", returnType: CAPPluginReturnPromise),
@@ -39,11 +43,25 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     // Scoreboard overlays composited on the HaishinKit screen (appear in both the
     // native preview and the encoded stream). @ScreenActor-isolated.
-    // - scoreboard: legacy plain-text placeholder.
-    // - overlayImage: the REAL path — a full-frame transparent PNG rendered by the
-    //   web control page (a broadcast Pro-TV scoreboard), composited 1:1.
+    // - scoreboard: legacy plain-text placeholder (unused; kept for compatibility).
+    // - overlayImage: legacy single full-frame overlay (unused now; the layered
+    //   board/screen/top objects below replaced it).
     @ScreenActor private var scoreboard: TextScreenObject?
     @ScreenActor private var overlayImage: ImageScreenObject?
+
+    // Layered overlay compositing (replaces the single full-frame PNG). Three
+    // stacked ImageScreenObjects pre-created in z-order so sponsor+watermark always
+    // draw OVER the screen takeover and the board UNDER it:
+    //   camera → board → screen → top(sponsor+watermark)
+    // Each is fed independently (only the changed layer re-encodes on the JS side),
+    // and the screen SLIDE is animated NATIVELY by moving its layoutMargin — so a
+    // full-frame animation needs ZERO per-frame PNG.
+    @ScreenActor private var boardLayer: ImageScreenObject?
+    @ScreenActor private var screenLayer: ImageScreenObject?
+    @ScreenActor private var topLayer: ImageScreenObject?
+    @ScreenActor private var overlayLayersReady = false
+    private var screenSlideTask: Task<Void, Never>?
+    private var screenSlideHeight: CGFloat = 1080
 
     private let mixer = MediaMixer(
         multiCamSessionEnabled: false,
@@ -216,17 +234,134 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    /// Composite a full-frame transparent overlay bitmap (the real broadcast
-    /// scoreboard rendered by the web control page) onto the stream. This is the
-    /// production bitmap-bridge: web draws pixels → native composites them, so ALL
-    /// overlays (any Pro-TV board, pool board, sponsors, watermark) reuse one path.
+    /// Legacy single-layer overlay entry point. Now routes to the BOARD layer so
+    /// any old caller keeps working; new JS uses setBoardOverlay/setTopOverlay.
     @objc func updateOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task {
-            let ok = await self.applyOverlayImage(img)
-            self.reportDiag("overlay.image", ["ok": ok, "bytes": img.count])
-            call.resolve(["ok": ok])
+        Task { await self.applyLayer(.board, img); call.resolve(["ok": true]) }
+    }
+
+    /// Board (scoreboard) layer — bottom overlay, under the screen takeover.
+    @objc func setBoardOverlay(_ call: CAPPluginCall) {
+        let img = call.getString("image") ?? ""
+        Task { await self.applyLayer(.board, img); call.resolve(["ok": true]) }
+    }
+
+    /// Top layer (sponsor logo + watermark) — drawn OVER the screen takeover.
+    @objc func setTopOverlay(_ call: CAPPluginCall) {
+        let img = call.getString("image") ?? ""
+        Task { await self.applyLayer(.top, img); call.resolve(["ok": true]) }
+    }
+
+    /// Set (or clear) the full-frame screen takeover image. Position/visibility is
+    /// driven by animateScreen; this just loads the bitmap once.
+    @objc func setScreen(_ call: CAPPluginCall) {
+        let img = call.getString("image") ?? ""
+        Task { await self.applyScreenImage(img); call.resolve(["ok": true]) }
+    }
+
+    /// Slide the screen layer natively (no per-frame PNG): "in" from the top,
+    /// "out" to the bottom. Driven by a ~60fps task moving layoutMargin.top.
+    @objc func animateScreen(_ call: CAPPluginCall) {
+        let dir = call.getString("dir") ?? "in"
+        let durationMs = call.getDouble("durationMs") ?? 450
+        self.startScreenSlide(dir: dir, durationMs: durationMs)
+        call.resolve(["ok": true])
+    }
+
+    private enum OverlaySlot { case board, top }
+
+    /// Pre-create the three overlay layers in fixed z-order (board < screen < top)
+    /// so ordering is guaranteed regardless of when each first receives content.
+    @ScreenActor
+    private func ensureOverlayLayers() {
+        guard !overlayLayersReady else { return }
+        func make() -> ImageScreenObject {
+            let o = ImageScreenObject()
+            o.horizontalAlignment = .left
+            o.verticalAlignment = .top
+            o.isVisible = false
+            try? mixer.screen.addChild(o)
+            return o
         }
+        boardLayer = make()   // added first → bottom
+        screenLayer = make()  // middle
+        topLayer = make()     // added last → top
+        overlayLayersReady = true
+    }
+
+    private func decodeCGImage(_ b64: String) -> CGImage? {
+        let parts = b64.components(separatedBy: ",")
+        let raw = parts.count > 1 ? parts[parts.count - 1] : b64
+        guard let data = Data(base64Encoded: raw, options: .ignoreUnknownCharacters),
+              let image = UIImage(data: data) else { return nil }
+        return image.cgImage
+    }
+
+    @ScreenActor
+    private func applyLayer(_ slot: OverlaySlot, _ b64: String) {
+        ensureOverlayLayers()
+        let layer = slot == .board ? boardLayer : topLayer
+        if b64.isEmpty {
+            layer?.isVisible = false
+            layer?.cgImage = nil
+            return
+        }
+        guard let cg = decodeCGImage(b64) else { return }
+        layer?.cgImage = cg
+        layer?.isVisible = true
+    }
+
+    @ScreenActor
+    private func applyScreenImage(_ b64: String) {
+        ensureOverlayLayers()
+        if b64.isEmpty {
+            screenLayer?.isVisible = false
+            screenLayer?.cgImage = nil
+            return
+        }
+        guard let cg = decodeCGImage(b64) else { return }
+        screenLayer?.cgImage = cg
+        // Visibility + position handled by animateScreen.
+    }
+
+    // MARK: - Native screen slide
+
+    private func startScreenSlide(dir: String, durationMs: Double) {
+        screenSlideTask?.cancel()
+        let h = screenSlideHeight
+        let startY: CGFloat = dir == "in" ? -h : 0
+        let endY: CGFloat = dir == "in" ? 0 : h
+        let dur = max(0.05, durationMs / 1000.0)
+        let started = Date()
+        screenSlideTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let elapsed = Date().timeIntervalSince(started)
+                let p = min(1.0, elapsed / dur)
+                let e = 1 - pow(1 - p, 3) // easeOutCubic
+                let y = startY + (endY - startY) * CGFloat(e)
+                await self.setScreenSlideOffset(y)
+                if p >= 1 { break }
+                try? await Task.sleep(nanoseconds: 16_000_000) // ~60fps
+            }
+            if dir == "out" {
+                await self.hideScreenLayer()
+            }
+        }
+    }
+
+    @ScreenActor
+    private func setScreenSlideOffset(_ y: CGFloat) {
+        screenLayer?.isVisible = true
+        screenLayer?.layoutMargin = .init(top: y, left: 0, bottom: 0, right: 0)
+    }
+
+    @ScreenActor
+    private func hideScreenLayer() {
+        screenLayer?.isVisible = false
+        screenLayer?.cgImage = nil
+        screenLayer?.layoutMargin = .init(top: 0, left: 0, bottom: 0, right: 0)
     }
 
     @ScreenActor
@@ -412,6 +547,9 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     // MARK: - Pipeline
 
     private func setupPipeline(width: Int, height: Int, fps: Double) async throws {
+        // Screen-slide travel distance = the composite height (the screen image is
+        // full-frame). Kept current in case the resolution changes.
+        self.screenSlideHeight = CGFloat(height)
         // CAPTURE setup runs ONCE (or when the resolution changes). This is the ONLY
         // guard vs the club version — the real app's React effects churn
         // startPreview ~4x/sec, and a full capture re-attach on each call thrashes
@@ -627,6 +765,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     @ScreenActor
     private func setScreenSize(_ size: CGSize) {
         mixer.screen.size = size
+        ensureOverlayLayers()
     }
 
     private func sessionPreset(for width: Int, height: Int) -> AVCaptureSession.Preset {
