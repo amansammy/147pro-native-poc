@@ -242,33 +242,56 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
     /// Content-sized overlay layer: slot ∈ "board"|"sponsor"|"watermark", a SMALL
     /// bitmap positioned at (x,y) in composite px. This is the production path.
+    /// The PNG is decoded on a BACKGROUND thread (this Task), NOT on the @ScreenActor
+    /// — decoding on the compositor actor blocked it every update (pool clock /
+    /// crossfade / screen), starving the composite and dropping frames.
     @objc func setOverlayLayer(_ call: CAPPluginCall) {
         let slot = call.getString("slot") ?? "board"
         let img = call.getString("image") ?? ""
         let x = CGFloat(call.getDouble("x") ?? 0)
         let y = CGFloat(call.getDouble("y") ?? 0)
-        Task { await self.applyOverlaySlot(slot, img, x, y); call.resolve(["ok": true]) }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg = img.isEmpty ? nil : self.decodeCGImage(img)
+            await self.setLayerImage(slot, cg, img.isEmpty, x, y)
+            call.resolve(["ok": true])
+        }
     }
 
     // Legacy full-frame entry points — route to the board slot at origin so an old
     // caller still shows something; new JS uses setOverlayLayer.
     @objc func updateOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyOverlaySlot("board", img, 0, 0); call.resolve(["ok": true]) }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg = img.isEmpty ? nil : self.decodeCGImage(img)
+            await self.setLayerImage("board", cg, img.isEmpty, 0, 0)
+            call.resolve(["ok": true])
+        }
     }
     @objc func setBoardOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyOverlaySlot("board", img, 0, 0); call.resolve(["ok": true]) }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg = img.isEmpty ? nil : self.decodeCGImage(img)
+            await self.setLayerImage("board", cg, img.isEmpty, 0, 0)
+            call.resolve(["ok": true])
+        }
     }
     @objc func setTopOverlay(_ call: CAPPluginCall) {
         call.resolve(["ok": true])
     }
 
-    /// Set (or clear) the full-frame screen takeover image. Position/visibility is
-    /// driven by animateScreen; this just loads the bitmap once.
+    /// Set (or clear) the full-frame screen takeover image. Decoded off the
+    /// compositor actor (full-frame decode blocking it was the screen-toggle stutter).
     @objc func setScreen(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyScreenImage(img); call.resolve(["ok": true]) }
+        Task.detached { [weak self] in
+            guard let self else { return }
+            let cg = img.isEmpty ? nil : self.decodeCGImage(img)
+            await self.setScreenImage(cg, img.isEmpty)
+            call.resolve(["ok": true])
+        }
     }
 
     /// Slide the screen layer natively (no per-frame PNG): "in" from the top,
@@ -308,8 +331,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         return image.cgImage
     }
 
+    /// Actor-side setter — takes an ALREADY-decoded image so the only work on the
+    /// compositor actor is the cheap cgImage/layout assignment (no PNG decode).
     @ScreenActor
-    private func applyOverlaySlot(_ slot: String, _ b64: String, _ x: CGFloat, _ y: CGFloat) {
+    private func setLayerImage(_ slot: String, _ cg: CGImage?, _ clear: Bool, _ x: CGFloat, _ y: CGFloat) {
         ensureOverlayLayers()
         let layer: ImageScreenObject?
         switch slot {
@@ -318,15 +343,11 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         default: layer = boardLayer
         }
         guard let layer else { return }
-        if b64.isEmpty {
+        if clear || cg == nil {
             layer.isVisible = false
             layer.cgImage = nil
             return
         }
-        guard let cg = decodeCGImage(b64) else { return }
-        // Position via layoutMargin (top-left aligned); the image's natural size is
-        // the blend area. Set margin BEFORE cgImage so its didSet re-lays out with
-        // the new position; invalidate too in case the image is unchanged.
         layer.layoutMargin = .init(top: y, left: x, bottom: 0, right: 0)
         layer.cgImage = cg
         layer.invalidateLayout()
@@ -334,14 +355,13 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @ScreenActor
-    private func applyScreenImage(_ b64: String) {
+    private func setScreenImage(_ cg: CGImage?, _ clear: Bool) {
         ensureOverlayLayers()
-        if b64.isEmpty {
+        if clear || cg == nil {
             screenLayer?.isVisible = false
             screenLayer?.cgImage = nil
             return
         }
-        guard let cg = decodeCGImage(b64) else { return }
         screenLayer?.cgImage = cg
         // Visibility + position handled by animateScreen.
     }
