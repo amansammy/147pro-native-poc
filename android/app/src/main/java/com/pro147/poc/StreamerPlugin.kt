@@ -16,19 +16,22 @@ import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
 import com.pedro.common.ConnectChecker
 import com.pedro.library.generic.GenericStream
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Timer
 import java.util.TimerTask
+import java.util.UUID
 
 /**
  * Android native streaming plugin — the RootEncoder counterpart to the iOS
  * HaishinKit StreamerPlugin. Same JS bridge contract (jsName "Streamer", same
  * methods/events) so the web app drives both platforms with zero web changes.
  *
- * v1 = the VERIFIED core (against RootEncoder 2.6.1): permissions, preview,
- * 1080p60 H.264 → RTMP(S), stop, connection lifecycle, and media.tick status
- * events. Overlays, zoom, mute, and lens switching are stubbed no-ops for now —
- * their RootEncoder APIs are added next, once basic streaming is confirmed on the
- * Nord 3. The stubs still resolve() so the shared web bridge never errors.
+ * v1 = verified core (RootEncoder 2.6.1): permissions, preview, 1080p60 H.264 →
+ * RTMP(S), stop, connection lifecycle, media.tick. Overlays/zoom/mute/lens are
+ * stubbed no-ops until basic streaming is confirmed. Emits diagnostics to the
+ * server (stream-diag.log, tagged platform=android) for remote debugging.
  */
 @CapacitorPlugin(
     name = "Streamer",
@@ -54,6 +57,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var isLive = false
     private var diagTimer: Timer? = null
 
+    // Remote diagnostics: POST to the server so we can debug the device without
+    // an on-screen error. Tagged so Android entries are distinguishable in the log.
+    private val diagEnabled = true
+    private val diagTag = UUID.randomUUID().toString().substring(0, 8)
+
     // ------------------------------------------------------------------
     // Lifecycle helpers
     // ------------------------------------------------------------------
@@ -64,6 +72,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             getGlInterface().autoHandleOrientation = true
         }
         genericStream = s
+        reportDiag("stream.created")
         return s
     }
 
@@ -81,8 +90,10 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         streamW = call.getInt("width", 1920)!!
         streamH = call.getInt("height", 1080)!!
         streamFps = call.getInt("fps", 60)!!
+        reportDiag("startPreview.call", mapOf("w" to streamW, "h" to streamH, "fps" to streamFps))
 
         if (!hasCapturePermissions()) {
+            reportDiag("perms.request")
             requestAllPermissions(call, "onCapturePermsResult")
             return
         }
@@ -91,7 +102,9 @@ class StreamerPlugin : Plugin(), ConnectChecker {
 
     @PermissionCallback
     private fun onCapturePermsResult(call: PluginCall) {
-        if (!hasCapturePermissions()) {
+        val granted = hasCapturePermissions()
+        reportDiag("perms.result", mapOf("granted" to granted))
+        if (!granted) {
             call.reject("Camera and microphone permission are required to stream.")
             return
         }
@@ -103,46 +116,48 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             try {
                 ensureStream()
                 if (previewView == null) buildPreviewView()
-                // Don't start the GL preview yet — the SurfaceView is still 0×0 until
-                // setPreviewRect sizes it. Starting RootEncoder's preview on a zero /
-                // not-yet-created surface throws "FrameBuffer uncompleted (36054)".
-                // maybeStartPreview() runs it once the surface is created AND sized,
-                // driven by the SurfaceHolder callbacks + setPreviewRect.
                 wantPreview = true
                 maybeStartPreview()
                 notifyStatus("preview", JSObject())
                 call.resolve()
             } catch (e: Exception) {
+                reportDiag("startPreview.error", mapOf("error" to (e.message ?: "?")))
                 call.reject("startPreview failed: ${e.message}", e)
             }
         }
     }
 
-    /** Start RootEncoder's preview only when it's safe: preview requested, a valid
-     *  Surface exists, and it has a non-zero size (else GL framebuffer is incomplete).
-     *  Idempotent + retried from every surface callback and setPreviewRect. */
+    /** Start RootEncoder's preview only when safe: requested, a valid Surface exists,
+     *  and it has a non-zero size (else GL framebuffer is incomplete, code 36054).
+     *  Idempotent; retried from every surface callback and setPreviewRect. */
     private fun maybeStartPreview() {
         val stream = genericStream ?: return
         val surface = previewView ?: return
         if (!wantPreview || previewStarted) return
-        if (surface.width <= 0 || surface.height <= 0) return
-        val holder = surface.holder
-        if (holder.surface == null || !holder.surface.isValid) return
+        val w = surface.width
+        val h = surface.height
+        val valid = surface.holder.surface?.isValid == true
+        if (w <= 0 || h <= 0 || !valid) {
+            reportDiag("preview.skip", mapOf("w" to w, "h" to h, "valid" to valid))
+            return
+        }
         try {
             stream.startPreview(surface)
             previewStarted = true
+            reportDiag("preview.ok", mapOf("w" to w, "h" to h))
         } catch (e: Exception) {
-            // Leave previewStarted=false; will retry on the next surfaceChanged.
+            reportDiag("preview.error", mapOf("error" to (e.message ?: "?"), "w" to w, "h" to h))
         }
     }
 
-    /** SurfaceView in a container laid over the WebView; zero-sized until
-     *  setPreviewRect positions it. */
+    /** SurfaceView laid over the WebView. zOrderOnTop so the camera composites ABOVE
+     *  the opaque WebView (a default SurfaceView renders behind the window → black). */
     private fun buildPreviewView() {
         val root = activity.window.decorView as ViewGroup
         val container = FrameLayout(context)
         container.setBackgroundColor(Color.BLACK)
         val surface = SurfaceView(context)
+        surface.setZOrderOnTop(true)
         container.addView(
             surface,
             FrameLayout.LayoutParams(
@@ -152,17 +167,22 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         )
         root.addView(container, FrameLayout.LayoutParams(0, 0))
         surface.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) { maybeStartPreview() }
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                reportDiag("surface.created")
+                maybeStartPreview()
+            }
             override fun surfaceChanged(holder: SurfaceHolder, f: Int, w: Int, h: Int) {
+                reportDiag("surface.changed", mapOf("w" to w, "h" to h))
                 maybeStartPreview()
             }
             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                // Surface gone (e.g. rotation / background) — allow a clean re-start.
+                reportDiag("surface.destroyed")
                 previewStarted = false
             }
         })
         previewView = surface
         previewContainer = container
+        reportDiag("preview.built")
     }
 
     @PluginMethod
@@ -182,8 +202,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 lp.height = h.toInt()
                 container.layoutParams = lp
             }
-            // Now that the preview has a real size, the surface can create its GL
-            // framebuffer — start the preview if it was waiting on a size.
+            reportDiag("previewRect", mapOf("w" to w.toInt(), "h" to h.toInt()))
             maybeStartPreview()
             call.resolve()
         }
@@ -205,6 +224,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         streamH = call.getInt("height", streamH)!!
         streamFps = call.getInt("fps", streamFps)!!
         targetBitrate = call.getInt("bitrate", targetBitrate)!!
+        reportDiag("startStream.call", mapOf("w" to streamW, "h" to streamH, "fps" to streamFps, "bitrate" to targetBitrate))
 
         if (!hasCapturePermissions()) {
             call.reject("Camera and microphone permission are required to stream.")
@@ -214,9 +234,9 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         activity.runOnUiThread {
             try {
                 val stream = ensureStream()
-                // Positional args (width, height, bitrate, fps) — 4th param is fps.
                 val okVideo = stream.prepareVideo(streamW, streamH, targetBitrate, streamFps)
                 val okAudio = stream.prepareAudio(44100, true, 128_000)
+                reportDiag("prepare", mapOf("video" to okVideo, "audio" to okAudio))
                 if (!okVideo || !okAudio) {
                     call.reject("Encoder prepare failed (video=$okVideo audio=$okAudio)")
                     return@runOnUiThread
@@ -228,6 +248,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 notifyStatus("live", JSObject().put("url", url))
                 call.resolve()
             } catch (e: Exception) {
+                reportDiag("startStream.error", mapOf("error" to (e.message ?: "?")))
                 call.reject("startStream failed: ${e.message}", e)
             }
         }
@@ -242,6 +263,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 StreamingForegroundService.stop(context)
                 isLive = false
                 notifyStatus("idle", JSObject())
+                reportDiag("stopStream.ok")
             } catch (e: Exception) {
                 // Stopping must never throw up to the UI.
             }
@@ -251,9 +273,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
 
     // ------------------------------------------------------------------
     // Stubs — resolve so the shared web bridge never errors. Real RootEncoder
-    // implementations (overlays via ImageObjectFilterRender, zoom via
-    // Camera2Source, mute via the audio source, lens via switchCamera) land after
-    // basic streaming is verified on device.
+    // implementations land after basic streaming is verified on device.
     // ------------------------------------------------------------------
 
     @PluginMethod fun setLens(call: PluginCall) {
@@ -285,14 +305,12 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         diagTimer = Timer()
         diagTimer?.scheduleAtFixedRate(object : TimerTask() {
             override fun run() {
-                val data = JSObject()
-                    .put("event", "media.tick")
-                    .put("kind", "native-stream-diag")
-                    .put("fps", streamFps)
-                    .put("bitRate", targetBitrate)
-                    .put("bytesPerSec", lastBitrate / 8)
-                    .put("connected", isLive)
-                notifyListeners("status", data)
+                reportDiag("media.tick", mapOf(
+                    "fps" to streamFps,
+                    "bitRate" to targetBitrate,
+                    "bytesPerSec" to lastBitrate / 8,
+                    "connected" to isLive
+                ))
             }
         }, 2000, 2000)
     }
@@ -307,19 +325,48 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         notifyListeners("status", extra)
     }
 
+    /** Emit an event to JS listeners AND POST it to the server diag log (tagged
+     *  platform=android) so the device can be debugged remotely. */
+    private fun reportDiag(event: String, extra: Map<String, Any?> = emptyMap()) {
+        val obj = JSONObject()
+        obj.put("kind", "native-stream-diag")
+        obj.put("platform", "android")
+        obj.put("tag", diagTag)
+        obj.put("event", event)
+        obj.put("t", System.currentTimeMillis())
+        for ((k, v) in extra) obj.put(k, v)
+        try { notifyListeners("status", JSObject.fromJSONObject(obj)) } catch (_: Exception) {}
+        if (!diagEnabled) return
+        Thread {
+            try {
+                val conn = URL("https://app.147pro.com/_api/stream-diag").openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "text/plain")
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.doOutput = true
+                conn.outputStream.use { it.write(obj.toString().toByteArray()) }
+                conn.responseCode
+                conn.disconnect()
+            } catch (_: Exception) {}
+        }.start()
+    }
+
     // ------------------------------------------------------------------
     // ConnectChecker (RootEncoder connection lifecycle)
     // ------------------------------------------------------------------
 
-    override fun onConnectionStarted(url: String) {}
+    override fun onConnectionStarted(url: String) { reportDiag("rtmp.started") }
 
     override fun onConnectionSuccess() {
         isLive = true
+        reportDiag("rtmp.success")
         notifyStatus("live", JSObject())
     }
 
     override fun onConnectionFailed(reason: String) {
         isLive = false
+        reportDiag("rtmp.failed", mapOf("reason" to reason))
         notifyStatus("error", JSObject().put("reason", reason))
     }
 
@@ -329,12 +376,14 @@ class StreamerPlugin : Plugin(), ConnectChecker {
 
     override fun onDisconnect() {
         isLive = false
+        reportDiag("rtmp.disconnect")
         notifyStatus("idle", JSObject())
     }
 
     override fun onAuthError() {
+        reportDiag("rtmp.authError")
         notifyStatus("error", JSObject().put("reason", "auth"))
     }
 
-    override fun onAuthSuccess() {}
+    override fun onAuthSuccess() { reportDiag("rtmp.authSuccess") }
 }
