@@ -1,6 +1,7 @@
 import Foundation
 import Capacitor
 import HaishinKit
+import RTMPHaishinKit
 import AVFoundation
 import VideoToolbox
 import UIKit
@@ -66,10 +67,12 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     private var screenSlideHeight: CGFloat = 1080
 
     private let mixer = MediaMixer(
-        multiCamSessionEnabled: false,
-        multiTrackAudioMixingEnabled: false,
-        useManualCapture: false
+        captureSessionMode: .single,
+        multiTrackAudioMixingEnabled: false
     )
+    // The encoder settings last applied to the stream (2.2.x's setVideoSettings takes
+    // a fresh VideoCodecSettings; keep our copy so thermal bitrate tweaks can mutate it).
+    private var appliedVideoSettings = VideoCodecSettings()
     private var connection: RTMPConnection?
     private var stream: RTMPStream?
     private var previewView: MTHKView?
@@ -181,14 +184,17 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             "camera": "\(AVCaptureDevice.authorizationStatus(for: .video).rawValue)",
             "mic": "\(AVCaptureDevice.authorizationStatus(for: .audio).rawValue)"
         ])
-        var videoSettings = await stream.videoSettings
-        videoSettings.videoSize = CGSize(width: streamW, height: streamH)
-        videoSettings.bitRate = targetBitrate
         // High + AutoLevel: Baseline 3.1 (the default) caps at 720p and emits ZERO
         // frames at 1080p; High/AutoLevel lets VideoToolbox pick the level 1080p60
         // needs and is the quality tier we want.
-        videoSettings.profileLevel = kVTProfileLevel_H264_High_AutoLevel as String
-        await stream.setVideoSettings(videoSettings)
+        let videoSettings = VideoCodecSettings(
+            videoSize: CGSize(width: streamW, height: streamH),
+            bitRate: targetBitrate,
+            profileLevel: kVTProfileLevel_H264_High_AutoLevel as String,
+            expectedFrameRate: streamFps
+        )
+        try? await stream.setVideoSettings(videoSettings)
+        self.appliedVideoSettings = videoSettings
         self.appliedBitrate = targetBitrate
         self.reportDiag("videoSettings.applied", ["w": streamW, "h": streamH, "bitRate": targetBitrate, "profile": "H264_High_AutoLevel"])
 
@@ -308,6 +314,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     @ScreenActor
     private func ensureOverlayLayers() {
         guard !overlayLayersReady else { return }
+        // GPU (Core Image) compositor instead of the CPU vImage one — moves the
+        // per-frame overlay/camera blend off the CPU, the whole point of the 2.2.x
+        // upgrade. (Flag is deprecated only because GPU is becoming the default.)
+        mixer.screen.isGPURendererEnabled = true
         func make() -> ImageScreenObject {
             let o = ImageScreenObject()
             o.horizontalAlignment = .left
@@ -633,6 +643,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
             await setScreenSize(CGSize(width: width, height: height))
 
+            // 2.2.x requires an explicit start of the capture session (2.0.9 started
+            // it implicitly on attach).
+            await mixer.startRunning()
+
             captureConfigured = true
             configuredWidth = width
             configuredHeight = height
@@ -644,7 +658,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         // above is skipped (same resolution) so the fps would otherwise never
         // update. setFrameRate re-selects a 60-capable activeFormat as needed.
         if fps != configuredFps {
-            await mixer.setFrameRate(fps)
+            try? await mixer.setFrameRate(fps)   // 2.2.x: throws
             configuredFps = fps
             reportDiag("frameRate.set", ["fps": fps])
         }
@@ -958,9 +972,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
                 let desired = self.bitrateForThermal()
                 if desired != self.appliedBitrate {
-                    var vs = await stream.videoSettings
+                    var vs = self.appliedVideoSettings
                     vs.bitRate = desired
-                    await stream.setVideoSettings(vs)   // live, no encoder rebuild
+                    try? await stream.setVideoSettings(vs)   // live, no encoder rebuild
+                    self.appliedVideoSettings = vs
                     self.appliedBitrate = desired
                     self.reportDiag("bitrate.adapt", ["bitRate": desired, "thermal": self.thermalStateString()])
                 }
