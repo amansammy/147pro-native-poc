@@ -51,6 +51,9 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var previewStarted = false
     private var wantPreview = false
     private var prepared = false
+    private var preparedW = 0
+    private var preparedH = 0
+    private var preparedFps = 0
 
     private var streamW = 1920
     private var streamH = 1080
@@ -157,6 +160,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         val okV = stream.prepareVideo(streamW, streamH, targetBitrate, streamFps)
         val okA = stream.prepareAudio(44100, true, 128_000)
         prepared = okV && okA
+        if (prepared) { preparedW = streamW; preparedH = streamH; preparedFps = streamFps }
         reportDiag("prepare", mapOf("video" to okV, "audio" to okA, "w" to streamW, "h" to streamH))
         return prepared
     }
@@ -305,12 +309,28 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         activity.runOnUiThread {
             try {
                 val stream = ensureStream()
-                val okVideo = stream.prepareVideo(streamW, streamH, targetBitrate, streamFps)
-                val okAudio = stream.prepareAudio(44100, true, 128_000)
-                reportDiag("prepare", mapOf("video" to okVideo, "audio" to okAudio))
-                if (!okVideo || !okAudio) {
-                    call.reject("Encoder prepare failed (video=$okVideo audio=$okAudio)")
-                    return@runOnUiThread
+                // RootEncoder forbids prepareVideo while preview/stream is running.
+                // The encoder was already prepared for the preview, so:
+                //  - same resolution/fps  → just apply the chosen bitrate live.
+                //  - different res/fps     → stop preview, re-prepare, restart preview.
+                val needReprepare = !prepared ||
+                    preparedW != streamW || preparedH != streamH || preparedFps != streamFps
+                if (needReprepare) {
+                    if (stream.isOnPreview) stream.stopPreview()
+                    previewStarted = false
+                    val okV = stream.prepareVideo(streamW, streamH, targetBitrate, streamFps)
+                    val okA = stream.prepareAudio(44100, true, 128_000)
+                    prepared = okV && okA
+                    if (prepared) { preparedW = streamW; preparedH = streamH; preparedFps = streamFps }
+                    reportDiag("reprepare", mapOf("video" to okV, "audio" to okA, "w" to streamW, "h" to streamH))
+                    if (!prepared) {
+                        call.reject("Encoder prepare failed (video=$okV audio=$okA)")
+                        return@runOnUiThread
+                    }
+                    maybeStartPreview()
+                } else {
+                    try { stream.setVideoBitrateOnFly(targetBitrate) } catch (_: Exception) {}
+                    reportDiag("bitrate.set", mapOf("bitRate" to targetBitrate))
                 }
                 val fullUrl = if (url.endsWith("/")) "$url$key" else "$url/$key"
                 StreamingForegroundService.start(context)
