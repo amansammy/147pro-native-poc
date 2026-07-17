@@ -110,7 +110,8 @@ workflows:
     instance_type: mac_mini_m2
     environment:
       node: 20
-      java: 17
+      # Capacitor 7 requires JDK 21 (capacitor.build.gradle sets sourceCompatibility 21).
+      java: 21
     scripts:
       - name: Install npm dependencies
         script: npm ci

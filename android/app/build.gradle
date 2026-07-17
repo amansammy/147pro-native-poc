@@ -23,6 +23,11 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
+    // Capacitor 7 compiles Java at 21 (capacitor.build.gradle). Kotlin must match
+    // or the build errors with "Inconsistent JVM-target compatibility".
+    kotlinOptions {
+        jvmTarget = "21"
+    }
 }
 
 repositories {
