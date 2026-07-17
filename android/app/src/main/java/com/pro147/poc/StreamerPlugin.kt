@@ -1,7 +1,9 @@
 package com.pro147.poc
 
 import android.Manifest
+import android.content.Intent
 import android.graphics.Color
+import android.net.Uri
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -14,6 +16,7 @@ import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
+import androidx.browser.customtabs.CustomTabsIntent
 import com.pedro.common.ConnectChecker
 import com.pedro.library.generic.GenericStream
 import org.json.JSONObject
@@ -65,6 +68,12 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var lastBitrate: Long = 0
     private var isLive = false
     private var diagTimer: Timer? = null
+
+    // OAuth (Google login / YouTube connect) runs in a Chrome Custom Tab — Google
+    // blocks OAuth in a WebView. The pending call is resolved from handleOnNewIntent
+    // when the server redirects to pro147auth://.
+    private var oauthCall: PluginCall? = null
+    private var oauthScheme: String? = null
 
     // Remote diagnostics: POST to the server so we can debug the device without
     // an on-screen error. Tagged so Android entries are distinguishable in the log.
@@ -173,6 +182,10 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         try {
             stream.startPreview(surface)
             previewStarted = true
+            // Kick the GL preview to render the camera immediately — otherwise it
+            // stays grey until some later re-layout fires surfaceChanged (which is
+            // why the camera only appeared after tapping an overlay).
+            try { stream.getGlInterface().setPreviewResolution(w, h) } catch (_: Exception) {}
             reportDiag("preview.ok", mapOf("w" to w, "h" to h))
         } catch (e: Exception) {
             // Already-previewing is fine (state converged); anything else we log.
@@ -353,6 +366,52 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     @PluginMethod fun setOverlay(call: PluginCall) { call.resolve() }
     @PluginMethod fun setBoardOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
     @PluginMethod fun setTopOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
+
+    // ------------------------------------------------------------------
+    // OAuth (Chrome Custom Tabs) — Google login + YouTube connect
+    // ------------------------------------------------------------------
+
+    @PluginMethod
+    fun startOAuth(call: PluginCall) {
+        val url = call.getString("url")
+        val scheme = call.getString("callbackScheme")
+        if (url == null || scheme == null) {
+            call.reject("url and callbackScheme are required")
+            return
+        }
+        // Keep the call alive across the async browser round-trip; resolved in
+        // handleOnNewIntent when the server 302s to <scheme>://...
+        call.setKeepAlive(true)
+        oauthCall = call
+        oauthScheme = scheme
+        reportDiag("oauth.start", mapOf("scheme" to scheme))
+        activity.runOnUiThread {
+            try {
+                CustomTabsIntent.Builder().build().launchUrl(context, Uri.parse(url))
+            } catch (e: Exception) {
+                oauthCall = null
+                oauthScheme = null
+                reportDiag("oauth.error", mapOf("error" to (e.message ?: "?")))
+                call.reject("Failed to open sign-in browser: ${e.message}")
+            }
+        }
+    }
+
+    /** Capacitor routes deep-link intents here (MainActivity is singleTask +
+     *  registers the pro147auth:// intent-filter). Resolve the pending OAuth call
+     *  with the callback URL so nativeStartOAuthRaw gets the temp token. */
+    override fun handleOnNewIntent(intent: Intent) {
+        super.handleOnNewIntent(intent)
+        val data = intent.data ?: return
+        val scheme = oauthScheme ?: return
+        if (data.scheme == scheme) {
+            val call = oauthCall
+            oauthCall = null
+            oauthScheme = null
+            reportDiag("oauth.callback", mapOf("scheme" to scheme))
+            call?.resolve(JSObject().put("url", data.toString()))
+        }
+    }
 
     // ------------------------------------------------------------------
     // Status / diagnostics
