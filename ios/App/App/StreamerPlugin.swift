@@ -6,6 +6,7 @@ import AVFoundation
 import VideoToolbox
 import UIKit
 import AuthenticationServices
+import CryptoKit
 
 /// Native streaming plugin for the 147 Pro PoC.
 ///
@@ -37,11 +38,18 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "setFocusExposureLock", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setPreviewRect", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setMuted", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "startOAuth", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "startOAuth", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "signInWithApple", returnType: CAPPluginReturnPromise)
     ]
 
     // Retained so the auth session isn't deallocated mid-flow.
     private var authSession: ASWebAuthenticationSession?
+
+    // Native Sign in with Apple state. The pending Capacitor call is resolved from
+    // the ASAuthorizationController delegate callbacks; the raw nonce is echoed back
+    // to JS so the server can verify token.nonce === sha256(rawNonce).
+    private var appleSignInCall: CAPPluginCall?
+    private var appleRawNonce: String?
 
     // Scoreboard overlays composited on the HaishinKit screen (appear in both the
     // native preview and the encoded stream). @ScreenActor-isolated.
@@ -819,6 +827,60 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
+    /// Native "Sign in with Apple" via AuthenticationServices. Presents the
+    /// on-device Apple ID sheet (Face/Touch ID) — no web browser, so it avoids the
+    /// fragile Services-ID web flow. Resolves with the identity token (JWT) + the
+    /// raw nonce; the WebView JS POSTs these to /_api/auth/apple_native, which
+    /// verifies the token against Apple's JWKS and sets the session cookie.
+    ///
+    /// Requires the "Sign in with Apple" capability on the App ID and the
+    /// com.apple.developer.applesignin entitlement (App.entitlements).
+    @objc func signInWithApple(_ call: CAPPluginCall) {
+        let rawNonce = Self.randomNonceString()
+        self.appleRawNonce = rawNonce
+        self.appleSignInCall = call
+        DispatchQueue.main.async {
+            let provider = ASAuthorizationAppleIDProvider()
+            let request = provider.createRequest()
+            request.requestedScopes = [.fullName, .email]
+            // Apple stores whatever we set here and echoes it as the token's `nonce`
+            // claim. We set sha256(rawNonce) and send the raw nonce to the server.
+            request.nonce = Self.sha256(rawNonce)
+
+            let controller = ASAuthorizationController(authorizationRequests: [request])
+            controller.delegate = self
+            controller.presentationContextProvider = self
+            controller.performRequests()
+        }
+    }
+
+    // MARK: Sign in with Apple nonce helpers
+
+    private static func randomNonceString(length: Int = 32) -> String {
+        let charset: [Character] =
+            Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-._")
+        var result = ""
+        var remaining = length
+        while remaining > 0 {
+            var randoms = [UInt8](repeating: 0, count: 16)
+            let status = SecRandomCopyBytes(kSecRandomDefault, randoms.count, &randoms)
+            if status != errSecSuccess { continue }
+            for random in randoms {
+                if remaining == 0 { break }
+                if random < UInt8(charset.count) {
+                    result.append(charset[Int(random)])
+                    remaining -= 1
+                }
+            }
+        }
+        return result
+    }
+
+    private static func sha256(_ input: String) -> String {
+        let hashed = SHA256.hash(data: Data(input.utf8))
+        return hashed.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
     @objc func setPreviewRect(_ call: CAPPluginCall) {
         let x = CGFloat(call.getDouble("x") ?? 0)
         let y = CGFloat(call.getDouble("y") ?? 0)
@@ -1054,6 +1116,66 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
 
 extension StreamerPlugin: ASWebAuthenticationPresentationContextProviding {
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        return self.bridge?.viewController?.view.window ?? ASPresentationAnchor()
+    }
+}
+
+// MARK: - Native Sign in with Apple (ASAuthorizationController)
+
+extension StreamerPlugin: ASAuthorizationControllerDelegate {
+    public func authorizationController(
+        controller: ASAuthorizationController,
+        didCompleteWithAuthorization authorization: ASAuthorization
+    ) {
+        let call = self.appleSignInCall
+        self.appleSignInCall = nil
+
+        guard let credential = authorization.credential as? ASAuthorizationAppleIDCredential,
+              let tokenData = credential.identityToken,
+              let identityToken = String(data: tokenData, encoding: .utf8) else {
+            call?.reject("Apple sign-in did not return an identity token")
+            return
+        }
+
+        var result: [String: Any] = [
+            "identityToken": identityToken,
+            "user": credential.user
+        ]
+        if let rawNonce = self.appleRawNonce {
+            result["rawNonce"] = rawNonce
+        }
+        if let codeData = credential.authorizationCode,
+           let code = String(data: codeData, encoding: .utf8) {
+            result["authorizationCode"] = code
+        }
+        // email + fullName are only provided on the FIRST authorization.
+        if let email = credential.email {
+            result["email"] = email
+        }
+        if let given = credential.fullName?.givenName {
+            result["givenName"] = given
+        }
+        if let family = credential.fullName?.familyName {
+            result["familyName"] = family
+        }
+
+        call?.resolve(result)
+    }
+
+    public func authorizationController(
+        controller: ASAuthorizationController,
+        didCompleteWithError error: Error
+    ) {
+        let call = self.appleSignInCall
+        self.appleSignInCall = nil
+        call?.reject("Apple sign-in failed or cancelled: \(error.localizedDescription)")
+    }
+}
+
+extension StreamerPlugin: ASAuthorizationControllerPresentationContextProviding {
+    public func presentationAnchor(
+        for controller: ASAuthorizationController
+    ) -> ASPresentationAnchor {
         return self.bridge?.viewController?.view.window ?? ASPresentationAnchor()
     }
 }
