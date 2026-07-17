@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -115,10 +117,17 @@ class StreamerPlugin : Plugin(), ConnectChecker {
 
     @PluginMethod
     fun startPreview(call: PluginCall) {
-        streamW = call.getInt("width", 1920)!!
-        streamH = call.getInt("height", 1080)!!
-        streamFps = call.getInt("fps", 60)!!
-        reportDiag("startPreview.call", mapOf("w" to streamW, "h" to streamH, "fps" to streamFps))
+        // Prepare the encoder at 1080p60 regardless of the persisted preview quality
+        // the web passes (often 720p/30). This gives a smooth 60fps preview AND means
+        // the common 1080p60 go-live reuses the same prepared encoder (no disruptive
+        // stop/re-prepare churn). A non-1080p60 broadcast still re-prepares on go-live.
+        streamW = 1920
+        streamH = 1080
+        streamFps = 60
+        reportDiag("startPreview.call", mapOf(
+            "w" to streamW, "h" to streamH, "fps" to streamFps,
+            "reqW" to call.getInt("width", 0), "reqFps" to call.getInt("fps", 0)
+        ))
 
         if (!hasCapturePermissions()) {
             reportDiag("perms.request")
@@ -193,15 +202,36 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         try {
             stream.startPreview(surface)
             previewStarted = true
-            // Kick the GL preview to render the camera immediately — otherwise it
-            // stays grey until some later re-layout fires surfaceChanged (which is
-            // why the camera only appeared after tapping an overlay).
             try { stream.getGlInterface().setPreviewResolution(w, h) } catch (_: Exception) {}
             reportDiag("preview.ok", mapOf("w" to w, "h" to h))
+            // A zOrderOnTop SurfaceView over the WebView doesn't composite its first
+            // camera frame until a re-layout forces SurfaceFlinger to update the
+            // layer — which is why the preview stayed grey until an interaction (the
+            // "scoreboard trick"). Force that re-layout ourselves a few times as the
+            // camera spins up.
+            kickPreviewRender()
         } catch (e: Exception) {
             // Already-previewing is fine (state converged); anything else we log.
             previewStarted = stream.isOnPreview
             reportDiag("preview.error", mapOf("error" to (e.message ?: "?"), "w" to w, "h" to h))
+        }
+    }
+
+    /** Force the preview SurfaceView to composite its first camera frame: re-apply
+     *  setPreviewResolution + request a layout pass a few times while the camera
+     *  spins up. Mirrors what a manual interaction (re-layout) did. */
+    private fun kickPreviewRender() {
+        val handler = Handler(Looper.getMainLooper())
+        for (delay in longArrayOf(250L, 700L, 1500L)) {
+            handler.postDelayed({
+                val surface = previewView ?: return@postDelayed
+                val w = surface.width
+                val h = surface.height
+                if (w > 0 && h > 0) {
+                    try { genericStream?.getGlInterface()?.setPreviewResolution(w, h) } catch (_: Exception) {}
+                }
+                previewContainer?.requestLayout()
+            }, delay)
         }
     }
 
