@@ -47,6 +47,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var previewContainer: FrameLayout? = null
     private var previewStarted = false
     private var wantPreview = false
+    private var prepared = false
 
     private var streamW = 1920
     private var streamH = 1080
@@ -124,6 +125,10 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             try {
                 ensureStream()
                 if (previewView == null) buildPreviewView()
+                // CRITICAL: prepareVideo/prepareAudio MUST run before startPreview —
+                // that's what sizes RootEncoder's GL framebuffer. Skipping it makes
+                // startPreview throw "FrameBuffer uncompleted (36054)".
+                prepareEncoderIfNeeded()
                 wantPreview = true
                 maybeStartPreview()
                 notifyStatus("preview", JSObject())
@@ -133,6 +138,18 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 call.reject("startPreview failed: ${e.message}", e)
             }
         }
+    }
+
+    /** prepareVideo + prepareAudio — required before startPreview (sizes the GL
+     *  framebuffer) and before startStream. Idempotent; re-preparable when not live. */
+    private fun prepareEncoderIfNeeded(): Boolean {
+        val stream = genericStream ?: return false
+        if (prepared) return true
+        val okV = stream.prepareVideo(streamW, streamH, targetBitrate, streamFps)
+        val okA = stream.prepareAudio(44100, true, 128_000)
+        prepared = okV && okA
+        reportDiag("prepare", mapOf("video" to okV, "audio" to okA, "w" to streamW, "h" to streamH))
+        return prepared
     }
 
     /** Start RootEncoder's preview only when safe: requested, a valid Surface exists,
@@ -187,6 +204,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             }
             override fun surfaceChanged(holder: SurfaceHolder, f: Int, w: Int, h: Int) {
                 reportDiag("surface.changed", mapOf("w" to w, "h" to h))
+                // RootEncoder's example sets the preview resolution here so the GL
+                // interface sizes its preview framebuffer to the actual surface.
+                if (w > 0 && h > 0) {
+                    try { genericStream?.getGlInterface()?.setPreviewResolution(w, h) } catch (_: Exception) {}
+                }
                 maybeStartPreview()
             }
             override fun surfaceDestroyed(holder: SurfaceHolder) {
