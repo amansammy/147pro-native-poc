@@ -10,8 +10,10 @@ buildscript {
         classpath 'com.android.tools.build:gradle:8.7.2'
         classpath 'com.google.gms:google-services:4.4.2'
         // Kotlin — the native Streamer plugin (RootEncoder streaming) is written in
-        // Kotlin. 1.9.24 is compatible with AGP 8.7.2.
-        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.24'
+        // Kotlin. 2.1.0 is required to READ RootEncoder 2.6.1's dependency metadata
+        // (compiled with Kotlin 2.1.0); an older compiler errors "incompatible
+        // version of Kotlin ... metadata is 2.1.0". Compatible with AGP 8.7.2 + Gradle 8.11.
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0'
 
         // NOTE: Do not place your application dependencies here; they belong
         // in the individual module build.gradle files
