@@ -53,6 +53,14 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var streamFps = 60
     private var targetBitrate = 9_000_000
 
+    // Last real (non-zero) preview size, so a "hide" (rect 0×0 from the web's
+    // occlusion guard) can move the surface OFF-SCREEN at its real size instead of
+    // resizing it to 0 — resizing to 0 destroys the SurfaceView's surface and tears
+    // down RootEncoder's preview (churn → black/gray). iOS just repositions; Android
+    // must keep the surface alive.
+    private var lastPreviewW = 0
+    private var lastPreviewH = 0
+
     private var lastBitrate: Long = 0
     private var isLive = false
     private var diagTimer: Timer? = null
@@ -133,7 +141,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private fun maybeStartPreview() {
         val stream = genericStream ?: return
         val surface = previewView ?: return
-        if (!wantPreview || previewStarted) return
+        if (!wantPreview) return
+        // RootEncoder's own state is the source of truth — avoids my flag desyncing
+        // from it and double-starting ("Preview already started" errors).
+        if (stream.isOnPreview) { previewStarted = true; return }
+        if (previewStarted) return
         val w = surface.width
         val h = surface.height
         val valid = surface.holder.surface?.isValid == true
@@ -146,6 +158,8 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             previewStarted = true
             reportDiag("preview.ok", mapOf("w" to w, "h" to h))
         } catch (e: Exception) {
+            // Already-previewing is fine (state converged); anything else we log.
+            previewStarted = stream.isOnPreview
             reportDiag("preview.error", mapOf("error" to (e.message ?: "?"), "w" to w, "h" to h))
         }
     }
@@ -177,6 +191,10 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             }
             override fun surfaceDestroyed(holder: SurfaceHolder) {
                 reportDiag("surface.destroyed")
+                // Genuine teardown (app background). With off-screen hide this no
+                // longer fires during occlusion-guard churn, so it's safe to release
+                // RootEncoder's preview for a clean re-start when the surface returns.
+                try { genericStream?.let { if (it.isOnPreview) it.stopPreview() } } catch (_: Exception) {}
                 previewStarted = false
             }
         })
@@ -196,13 +214,31 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             previewContainer?.let { container ->
                 val lp = (container.layoutParams as? FrameLayout.LayoutParams)
                     ?: FrameLayout.LayoutParams(0, 0)
-                lp.leftMargin = x.toInt()
-                lp.topMargin = y.toInt()
-                lp.width = w.toInt()
-                lp.height = h.toInt()
+                val hide = w.toInt() <= 0 || h.toInt() <= 0
+                if (!hide) {
+                    // Show at the requested rect; remember the size.
+                    lastPreviewW = w.toInt()
+                    lastPreviewH = h.toInt()
+                    lp.leftMargin = x.toInt()
+                    lp.topMargin = y.toInt()
+                    lp.width = lastPreviewW
+                    lp.height = lastPreviewH
+                } else if (lastPreviewW > 0 && lastPreviewH > 0) {
+                    // Hide (occlusion guard): keep the last real SIZE so the surface
+                    // stays alive + RootEncoder keeps rendering, but push it fully
+                    // off-screen so web dropdowns/dialogs are visible.
+                    lp.width = lastPreviewW
+                    lp.height = lastPreviewH
+                    lp.leftMargin = -(lastPreviewW + 5000)
+                    lp.topMargin = 0
+                } else {
+                    // Never sized yet — nothing to show.
+                    lp.width = 0
+                    lp.height = 0
+                }
                 container.layoutParams = lp
             }
-            reportDiag("previewRect", mapOf("w" to w.toInt(), "h" to h.toInt()))
+            reportDiag("previewRect", mapOf("w" to w.toInt(), "h" to h.toInt(), "hidden" to (w.toInt() <= 0 || h.toInt() <= 0)))
             maybeStartPreview()
             call.resolve()
         }
