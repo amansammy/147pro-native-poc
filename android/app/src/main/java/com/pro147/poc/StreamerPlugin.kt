@@ -43,6 +43,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var previewView: SurfaceView? = null
     private var previewContainer: FrameLayout? = null
     private var previewStarted = false
+    private var wantPreview = false
 
     private var streamW = 1920
     private var streamH = 1080
@@ -100,17 +101,38 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private fun startPreviewInternal(call: PluginCall) {
         activity.runOnUiThread {
             try {
-                val stream = ensureStream()
+                ensureStream()
                 if (previewView == null) buildPreviewView()
-                if (!previewStarted) {
-                    previewView?.let { stream.startPreview(it) }
-                    previewStarted = true
-                }
+                // Don't start the GL preview yet — the SurfaceView is still 0×0 until
+                // setPreviewRect sizes it. Starting RootEncoder's preview on a zero /
+                // not-yet-created surface throws "FrameBuffer uncompleted (36054)".
+                // maybeStartPreview() runs it once the surface is created AND sized,
+                // driven by the SurfaceHolder callbacks + setPreviewRect.
+                wantPreview = true
+                maybeStartPreview()
                 notifyStatus("preview", JSObject())
                 call.resolve()
             } catch (e: Exception) {
                 call.reject("startPreview failed: ${e.message}", e)
             }
+        }
+    }
+
+    /** Start RootEncoder's preview only when it's safe: preview requested, a valid
+     *  Surface exists, and it has a non-zero size (else GL framebuffer is incomplete).
+     *  Idempotent + retried from every surface callback and setPreviewRect. */
+    private fun maybeStartPreview() {
+        val stream = genericStream ?: return
+        val surface = previewView ?: return
+        if (!wantPreview || previewStarted) return
+        if (surface.width <= 0 || surface.height <= 0) return
+        val holder = surface.holder
+        if (holder.surface == null || !holder.surface.isValid) return
+        try {
+            stream.startPreview(surface)
+            previewStarted = true
+        } catch (e: Exception) {
+            // Leave previewStarted=false; will retry on the next surfaceChanged.
         }
     }
 
@@ -130,9 +152,14 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         )
         root.addView(container, FrameLayout.LayoutParams(0, 0))
         surface.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {}
-            override fun surfaceChanged(holder: SurfaceHolder, f: Int, w: Int, h: Int) {}
-            override fun surfaceDestroyed(holder: SurfaceHolder) {}
+            override fun surfaceCreated(holder: SurfaceHolder) { maybeStartPreview() }
+            override fun surfaceChanged(holder: SurfaceHolder, f: Int, w: Int, h: Int) {
+                maybeStartPreview()
+            }
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                // Surface gone (e.g. rotation / background) — allow a clean re-start.
+                previewStarted = false
+            }
         })
         previewView = surface
         previewContainer = container
@@ -155,6 +182,9 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 lp.height = h.toInt()
                 container.layoutParams = lp
             }
+            // Now that the preview has a real size, the surface can create its GL
+            // framebuffer — start the preview if it was waiting on a size.
+            maybeStartPreview()
             call.resolve()
         }
     }
