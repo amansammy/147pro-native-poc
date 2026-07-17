@@ -49,16 +49,15 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     @ScreenActor private var scoreboard: TextScreenObject?
     @ScreenActor private var overlayImage: ImageScreenObject?
 
-    // Layered overlay compositing (replaces the single full-frame PNG). Three
-    // stacked ImageScreenObjects pre-created in z-order so sponsor+watermark always
-    // draw OVER the screen takeover and the board UNDER it:
-    //   camera → board → screen → top(sponsor+watermark)
-    // Each is fed independently (only the changed layer re-encodes on the JS side),
-    // and the screen SLIDE is animated NATIVELY by moving its layoutMargin — so a
-    // full-frame animation needs ZERO per-frame PNG.
-    @ScreenActor private var boardLayer: ImageScreenObject?
+    // Overlay compositing. TWO stacked ImageScreenObjects, pre-created in z-order:
+    //   camera → screen → overlay(board+sponsor+watermark)
+    // The board/sponsor/watermark are composited into ONE full-frame PNG on the JS
+    // side (so the compositor blends only ONE overlay layer per frame — PoC parity;
+    // compositing two always-on layers was tipping 1080p60 over the thermal edge).
+    // The screen takeover is its own layer BELOW the overlay so its SLIDE can be
+    // animated NATIVELY (layoutMargin) with zero per-frame PNG; overlay draws over it.
+    @ScreenActor private var overlayLayer: ImageScreenObject?
     @ScreenActor private var screenLayer: ImageScreenObject?
-    @ScreenActor private var topLayer: ImageScreenObject?
     @ScreenActor private var overlayLayersReady = false
     private var screenSlideTask: Task<Void, Never>?
     private var screenSlideHeight: CGFloat = 1080
@@ -238,23 +237,22 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    /// Legacy single-layer overlay entry point. Now routes to the BOARD layer so
-    /// any old caller keeps working; new JS uses setBoardOverlay/setTopOverlay.
+    /// Single merged overlay (board + sponsor + watermark) — drawn OVER the screen.
+    /// updateOverlay/setBoardOverlay are the same entry point; setTopOverlay is a
+    /// deprecated no-op (its content is merged into this one layer now).
     @objc func updateOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyLayer(.board, img); call.resolve(["ok": true]) }
+        Task { await self.applyOverlay(img); call.resolve(["ok": true]) }
     }
 
-    /// Board (scoreboard) layer — bottom overlay, under the screen takeover.
     @objc func setBoardOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyLayer(.board, img); call.resolve(["ok": true]) }
+        Task { await self.applyOverlay(img); call.resolve(["ok": true]) }
     }
 
-    /// Top layer (sponsor logo + watermark) — drawn OVER the screen takeover.
+    /// Deprecated: sponsor+watermark are merged into the single overlay now.
     @objc func setTopOverlay(_ call: CAPPluginCall) {
-        let img = call.getString("image") ?? ""
-        Task { await self.applyLayer(.top, img); call.resolve(["ok": true]) }
+        call.resolve(["ok": true])
     }
 
     /// Set (or clear) the full-frame screen takeover image. Position/visibility is
@@ -273,10 +271,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve(["ok": true])
     }
 
-    private enum OverlaySlot { case board, top }
-
-    /// Pre-create the three overlay layers in fixed z-order (board < screen < top)
-    /// so ordering is guaranteed regardless of when each first receives content.
+    /// Pre-create the two layers in fixed z-order (screen < overlay) so the overlay
+    /// (board+sponsor+watermark) always draws over the screen takeover.
     @ScreenActor
     private func ensureOverlayLayers() {
         guard !overlayLayersReady else { return }
@@ -288,9 +284,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             try? mixer.screen.addChild(o)
             return o
         }
-        boardLayer = make()   // added first → bottom
-        screenLayer = make()  // middle
-        topLayer = make()     // added last → top
+        screenLayer = make()   // added first → below (just above the camera)
+        overlayLayer = make()  // added last → on top
         overlayLayersReady = true
     }
 
@@ -303,17 +298,16 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @ScreenActor
-    private func applyLayer(_ slot: OverlaySlot, _ b64: String) {
+    private func applyOverlay(_ b64: String) {
         ensureOverlayLayers()
-        let layer = slot == .board ? boardLayer : topLayer
         if b64.isEmpty {
-            layer?.isVisible = false
-            layer?.cgImage = nil
+            overlayLayer?.isVisible = false
+            overlayLayer?.cgImage = nil
             return
         }
         guard let cg = decodeCGImage(b64) else { return }
-        layer?.cgImage = cg
-        layer?.isVisible = true
+        overlayLayer?.cgImage = cg
+        overlayLayer?.isVisible = true
     }
 
     @ScreenActor
