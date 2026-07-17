@@ -1,0 +1,5 @@
+# The Gradle wrapper + shell scripts MUST stay LF or they break on the Linux
+# Codemagic runner ("bad interpreter"). Windows dev checkouts otherwise use CRLF.
+gradlew text eol=lf
+*.sh text eol=lf
+gradlew.bat text eol=crlf

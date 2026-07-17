@@ -8,6 +8,7 @@
     "add:ios": "cap add ios"
   },
   "dependencies": {
+    "@capacitor/android": "^7.6.8",
     "@capacitor/core": "^7.0.0"
   },
   "devDependencies": {
