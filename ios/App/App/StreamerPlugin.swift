@@ -29,6 +29,7 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "updateOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setBoardOverlay", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setTopOverlay", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setOverlayLayer", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setScreen", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "animateScreen", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setZoom", returnType: CAPPluginReturnPromise),
@@ -49,14 +50,16 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     @ScreenActor private var scoreboard: TextScreenObject?
     @ScreenActor private var overlayImage: ImageScreenObject?
 
-    // Overlay compositing. TWO stacked ImageScreenObjects, pre-created in z-order:
-    //   camera → screen → overlay(board+sponsor+watermark)
-    // The board/sponsor/watermark are composited into ONE full-frame PNG on the JS
-    // side (so the compositor blends only ONE overlay layer per frame — PoC parity;
-    // compositing two always-on layers was tipping 1080p60 over the thermal edge).
-    // The screen takeover is its own layer BELOW the overlay so its SLIDE can be
-    // animated NATIVELY (layoutMargin) with zero per-frame PNG; overlay draws over it.
-    @ScreenActor private var overlayLayer: ImageScreenObject?
+    // CONTENT-SIZED overlay layers, pre-created in z-order:
+    //   camera → board → screen → sponsor → watermark
+    // Each layer receives a SMALL bitmap (just its element — scoreboard strip, logo
+    // box) positioned at (x,y). HaishinKit's CPU compositor blends each layer at its
+    // NATURAL pixel size, so small layers cost a fraction of a full-frame overlay per
+    // frame — the fix for the CPU blend cooking 1080p60. The screen takeover is
+    // full-frame (only when active) and slides natively via layoutMargin.
+    @ScreenActor private var boardLayer: ImageScreenObject?
+    @ScreenActor private var sponsorLayer: ImageScreenObject?
+    @ScreenActor private var watermarkLayer: ImageScreenObject?
     @ScreenActor private var screenLayer: ImageScreenObject?
     @ScreenActor private var overlayLayersReady = false
     private var screenSlideTask: Task<Void, Never>?
@@ -237,20 +240,26 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    /// Single merged overlay (board + sponsor + watermark) — drawn OVER the screen.
-    /// updateOverlay/setBoardOverlay are the same entry point; setTopOverlay is a
-    /// deprecated no-op (its content is merged into this one layer now).
+    /// Content-sized overlay layer: slot ∈ "board"|"sponsor"|"watermark", a SMALL
+    /// bitmap positioned at (x,y) in composite px. This is the production path.
+    @objc func setOverlayLayer(_ call: CAPPluginCall) {
+        let slot = call.getString("slot") ?? "board"
+        let img = call.getString("image") ?? ""
+        let x = CGFloat(call.getDouble("x") ?? 0)
+        let y = CGFloat(call.getDouble("y") ?? 0)
+        Task { await self.applyOverlaySlot(slot, img, x, y); call.resolve(["ok": true]) }
+    }
+
+    // Legacy full-frame entry points — route to the board slot at origin so an old
+    // caller still shows something; new JS uses setOverlayLayer.
     @objc func updateOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyOverlay(img); call.resolve(["ok": true]) }
+        Task { await self.applyOverlaySlot("board", img, 0, 0); call.resolve(["ok": true]) }
     }
-
     @objc func setBoardOverlay(_ call: CAPPluginCall) {
         let img = call.getString("image") ?? ""
-        Task { await self.applyOverlay(img); call.resolve(["ok": true]) }
+        Task { await self.applyOverlaySlot("board", img, 0, 0); call.resolve(["ok": true]) }
     }
-
-    /// Deprecated: sponsor+watermark are merged into the single overlay now.
     @objc func setTopOverlay(_ call: CAPPluginCall) {
         call.resolve(["ok": true])
     }
@@ -271,8 +280,8 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
         call.resolve(["ok": true])
     }
 
-    /// Pre-create the two layers in fixed z-order (screen < overlay) so the overlay
-    /// (board+sponsor+watermark) always draws over the screen takeover.
+    /// Pre-create the layers in fixed z-order so board sits under the screen and
+    /// sponsor+watermark over it: camera → board → screen → sponsor → watermark.
     @ScreenActor
     private func ensureOverlayLayers() {
         guard !overlayLayersReady else { return }
@@ -284,8 +293,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
             try? mixer.screen.addChild(o)
             return o
         }
-        screenLayer = make()   // added first → below (just above the camera)
-        overlayLayer = make()  // added last → on top
+        boardLayer = make()      // bottom
+        screenLayer = make()     // over board (full-frame takeover)
+        sponsorLayer = make()    // over screen
+        watermarkLayer = make()  // top
         overlayLayersReady = true
     }
 
@@ -298,16 +309,28 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
     }
 
     @ScreenActor
-    private func applyOverlay(_ b64: String) {
+    private func applyOverlaySlot(_ slot: String, _ b64: String, _ x: CGFloat, _ y: CGFloat) {
         ensureOverlayLayers()
+        let layer: ImageScreenObject?
+        switch slot {
+        case "sponsor": layer = sponsorLayer
+        case "watermark": layer = watermarkLayer
+        default: layer = boardLayer
+        }
+        guard let layer else { return }
         if b64.isEmpty {
-            overlayLayer?.isVisible = false
-            overlayLayer?.cgImage = nil
+            layer.isVisible = false
+            layer.cgImage = nil
             return
         }
         guard let cg = decodeCGImage(b64) else { return }
-        overlayLayer?.cgImage = cg
-        overlayLayer?.isVisible = true
+        // Position via layoutMargin (top-left aligned); the image's natural size is
+        // the blend area. Set margin BEFORE cgImage so its didSet re-lays out with
+        // the new position; invalidate too in case the image is unchanged.
+        layer.layoutMargin = .init(top: y, left: x, bottom: 0, right: 0)
+        layer.cgImage = cg
+        layer.invalidateLayout()
+        layer.isVisible = true
     }
 
     @ScreenActor
