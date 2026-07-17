@@ -364,7 +364,10 @@ public class StreamerPlugin: CAPPlugin, CAPBridgedPlugin {
                 let y = startY + (endY - startY) * CGFloat(e)
                 await self.setScreenSlideOffset(y)
                 if p >= 1 { break }
-                try? await Task.sleep(nanoseconds: 16_000_000) // ~60fps
+                // ~20fps (was 60): each slide frame RE-COMPOSITES the full-frame
+                // screen on the CPU, so 60fps for 450ms was a big heat burst on
+                // every toggle. 20fps still reads as a slide at a third of the cost.
+                try? await Task.sleep(nanoseconds: 50_000_000)
             }
             if dir == "out" {
                 await self.hideScreenLayer()
