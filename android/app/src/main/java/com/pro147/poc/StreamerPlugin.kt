@@ -20,8 +20,10 @@ import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
 import androidx.browser.customtabs.CustomTabsIntent
 import com.pedro.common.ConnectChecker
+import com.pedro.encoder.utils.CodecUtil
 import com.pedro.library.generic.GenericStream
 import com.pedro.library.util.BitrateAdapter
+import com.pedro.library.util.FpsListener
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -72,6 +74,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var lastPreviewH = 0
 
     private var lastBitrate: Long = 0
+    private var actualFps = 0
     private var isLive = false
     private var diagTimer: Timer? = null
 
@@ -101,6 +104,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         val s = GenericStream(context, this).apply {
             getGlInterface().autoHandleOrientation = true
         }
+        // Force the hardware H.264 encoder — a software fallback would choke on
+        // 1080p60 and cause the stutter (and heat). Must be set before prepareVideo.
+        try { s.forceCodecType(CodecUtil.CodecType.HARDWARE, CodecUtil.CodecType.HARDWARE) } catch (_: Exception) {}
+        // Real encoded fps for the diag + on-screen readout.
+        try { s.setFpsListener(FpsListener.Callback { fps -> actualFps = fps }) } catch (_: Exception) {}
         genericStream = s
         reportDiag("stream.created")
         return s
@@ -224,13 +232,21 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         val handler = Handler(Looper.getMainLooper())
         for (delay in longArrayOf(250L, 700L, 1500L)) {
             handler.postDelayed({
-                val surface = previewView ?: return@postDelayed
-                val w = surface.width
-                val h = surface.height
-                if (w > 0 && h > 0) {
-                    try { genericStream?.getGlInterface()?.setPreviewResolution(w, h) } catch (_: Exception) {}
+                val container = previewContainer ?: return@postDelayed
+                val lp = container.layoutParams as? FrameLayout.LayoutParams ?: return@postDelayed
+                // A plain requestLayout() with an unchanged size doesn't force
+                // SurfaceFlinger to recomposite the zOrderOnTop layer (why the camera
+                // stayed grey until rotation, esp. when starting already in landscape).
+                // A real 1px size nudge fires surfaceChanged -> setPreviewResolution ->
+                // composite, exactly like rotating did.
+                if (lp.width > 2 && lp.height > 2) {
+                    lp.width -= 1
+                    container.layoutParams = lp
+                    handler.post {
+                        lp.width += 1
+                        container.layoutParams = lp
+                    }
                 }
-                previewContainer?.requestLayout()
             }, delay)
         }
     }
@@ -482,7 +498,8 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         diagTimer?.scheduleAtFixedRate(object : TimerTask() {
             override fun run() {
                 reportDiag("media.tick", mapOf(
-                    "fps" to streamFps,
+                    "fps" to actualFps,
+                    "targetFps" to streamFps,
                     "w" to preparedW,
                     "h" to preparedH,
                     "bitRate" to targetBitrate,
