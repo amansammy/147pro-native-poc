@@ -19,6 +19,7 @@ import com.getcapacitor.annotation.PermissionCallback
 import androidx.browser.customtabs.CustomTabsIntent
 import com.pedro.common.ConnectChecker
 import com.pedro.library.generic.GenericStream
+import com.pedro.library.util.BitrateAdapter
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -71,6 +72,12 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var lastBitrate: Long = 0
     private var isLive = false
     private var diagTimer: Timer? = null
+
+    // Smoothly adapts the encoder bitrate to network congestion (RootEncoder's own
+    // mechanism) instead of the pipeline hard-stalling when the uplink can't sustain
+    // the target — which was causing the bitrate to swing 5–15 Mbps, YouTube to
+    // buffer, and the coupled preview to stutter.
+    private val bitrateAdapter = BitrateAdapter { bps -> genericStream?.setVideoBitrateOnFly(bps) }
 
     // OAuth (Google login / YouTube connect) runs in a Chrome Custom Tab — Google
     // blocks OAuth in a WebView. The pending call is resolved from handleOnNewIntent
@@ -332,6 +339,8 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                     try { stream.setVideoBitrateOnFly(targetBitrate) } catch (_: Exception) {}
                     reportDiag("bitrate.set", mapOf("bitRate" to targetBitrate))
                 }
+                // Cap adaptive bitrate at the chosen video+audio target.
+                bitrateAdapter.setMaxBitrate(targetBitrate + 128_000)
                 val fullUrl = if (url.endsWith("/")) "$url$key" else "$url/$key"
                 StreamingForegroundService.start(context)
                 stream.startStream(fullUrl)
@@ -444,6 +453,8 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             override fun run() {
                 reportDiag("media.tick", mapOf(
                     "fps" to streamFps,
+                    "w" to preparedW,
+                    "h" to preparedH,
                     "bitRate" to targetBitrate,
                     "bytesPerSec" to lastBitrate / 8,
                     "connected" to isLive
@@ -509,6 +520,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
 
     override fun onNewBitrate(bitrate: Long) {
         lastBitrate = bitrate
+        // Adapt down on congestion (and recover up when it clears) — keeps the
+        // pipeline flowing instead of stalling, so preview + fps stay smooth.
+        try {
+            bitrateAdapter.adaptBitrate(bitrate, genericStream?.getStreamClient()?.hasCongestion() ?: false)
+        } catch (_: Exception) {}
     }
 
     override fun onDisconnect() {
