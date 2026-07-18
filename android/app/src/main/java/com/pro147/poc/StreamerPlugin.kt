@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
@@ -191,6 +192,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         activity.runOnUiThread {
             try {
                 ensureStream()
+                forceMaxRefreshRate()
                 if (previewView == null) buildPreviewView()
                 // CRITICAL: prepareVideo/prepareAudio MUST run before startPreview —
                 // that's what sizes RootEncoder's GL framebuffer. Skipping it makes
@@ -609,6 +611,29 @@ class StreamerPlugin : Plugin(), ConnectChecker {
 
     private fun transparentBitmap(): Bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
 
+    /** Pin the display to its highest refresh-rate mode. RootEncoder's render loop
+     *  is single-threaded and the preview swapBuffer is vsync-locked, so if the
+     *  panel's adaptive refresh (VRR) throttles down while streaming, it drags the
+     *  encode fps down with it (the ~44fps symptom). Forcing max Hz gives the loop
+     *  headroom to hold 60fps. */
+    private fun forceMaxRefreshRate() {
+        try {
+            val window = activity.window
+            @Suppress("DEPRECATION")
+            val display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) activity.display
+                          else window.windowManager.defaultDisplay
+            val modes = display?.supportedModes ?: return
+            val best = modes.maxByOrNull { it.refreshRate } ?: return
+            val lp = window.attributes
+            lp.preferredDisplayModeId = best.modeId
+            lp.preferredRefreshRate = best.refreshRate
+            window.attributes = lp
+            reportDiag("refresh.forced", mapOf("hz" to best.refreshRate, "modeId" to best.modeId))
+        } catch (e: Exception) {
+            reportDiag("refresh.error", mapOf("error" to (e.message ?: "?")))
+        }
+    }
+
     /** Logs the camera's real capabilities to the diag so we can see whether this
      *  device even supports 1080p60 capture (the fps suspect) — and the actual
      *  camera IDs for the selector. */
@@ -626,21 +651,33 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         } catch (_: Exception) {}
     }
 
-    /** Returns the device's real cameras for the selector (id + facing). */
+    /** Returns the device's real cameras for the selector (id + facing label). */
     @PluginMethod fun getCameras(call: PluginCall) {
         activity.runOnUiThread {
             try {
                 val src = genericStream?.videoSource as? Camera2Source
                 val ids = src?.camerasAvailable()?.toList() ?: emptyList()
+                val cm = context.getSystemService(android.content.Context.CAMERA_SERVICE)
+                    as? android.hardware.camera2.CameraManager
                 val arr = com.getcapacitor.JSArray()
                 for (id in ids) {
                     val o = JSObject()
                     o.put("id", id)
+                    val facing = try {
+                        when (cm?.getCameraCharacteristics(id)
+                            ?.get(android.hardware.camera2.CameraCharacteristics.LENS_FACING)) {
+                            android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT -> "front"
+                            android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK -> "back"
+                            else -> "external"
+                        }
+                    } catch (_: Exception) { "unknown" }
+                    o.put("facing", facing)
                     arr.put(o)
                 }
                 val res = JSObject()
                 res.put("cameras", arr)
                 res.put("current", src?.getCurrentCameraId()?.toString() ?: "")
+                reportDiag("getCameras", mapOf("count" to ids.size))
                 call.resolve(res)
             } catch (e: Exception) {
                 call.reject("getCameras failed: ${e.message}")
