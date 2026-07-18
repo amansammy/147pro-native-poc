@@ -55,7 +55,7 @@ dependencies {
     // (realtime) + KEY_OPERATING_RATE=max so the hardware encoder runs at full clock
     // and can sustain 1080p60 (stock RootEncoder self-throttles → ~44fps). Still
     // 2.6.1 base = compileSdk 35, same GenericStream API. JitPack builds the commit.
-    implementation "com.github.amansammy.RootEncoder:library:b02a08f436"
+    implementation "com.github.amansammy.RootEncoder:library:a28fc69fad"
 
     // Chrome Custom Tabs — Google blocks OAuth inside a WebView on Android too, so
     // the native startOAuth runs the flow in a Custom Tab (mirrors iOS's

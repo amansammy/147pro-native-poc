@@ -11,6 +11,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.util.Size
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -84,6 +86,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private val watermarkFilter = ImageObjectFilterRender()
 
     private var usingFrontCamera = false
+    private var currentZoom = 1f
     private var preparedW = 0
     private var preparedH = 0
     private var preparedFps = 0
@@ -126,6 +129,26 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     // ------------------------------------------------------------------
     // Lifecycle helpers
     // ------------------------------------------------------------------
+
+    override fun load() {
+        super.load()
+        // Capture uncaught JVM crashes to the diag so the rotate-crash reports its
+        // actual stack (a hard crash otherwise leaves no trace on the server).
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, ex ->
+            try {
+                val sw = java.io.StringWriter()
+                ex.printStackTrace(java.io.PrintWriter(sw))
+                reportDiag("crash", mapOf(
+                    "thread" to thread.name,
+                    "msg" to (ex.message ?: ex.javaClass.simpleName),
+                    "stack" to sw.toString().take(1600)
+                ))
+                Thread.sleep(700) // let the POST flush before the process dies
+            } catch (_: Exception) {}
+            previous?.uncaughtException(thread, ex)
+        }
+    }
 
     private fun ensureStream(): GenericStream {
         genericStream?.let { return it }
@@ -294,6 +317,25 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         container.setBackgroundColor(Color.BLACK)
         val surface = SurfaceView(context)
         surface.setZOrderOnTop(true)
+        // Native pinch-to-zoom (web touches can't reach through the on-top surface,
+        // so — like iOS's gesture recognizer — the zoom is handled natively).
+        val scaleDetector = ScaleGestureDetector(context,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    val src = genericStream?.videoSource as? Camera2Source ?: return true
+                    try {
+                        val range = src.getZoomRange()
+                        currentZoom = (currentZoom * detector.scaleFactor)
+                            .coerceIn(range.lower, range.upper)
+                        src.setZoom(currentZoom)
+                    } catch (_: Exception) {}
+                    return true
+                }
+            })
+        container.setOnTouchListener { _: android.view.View, event: MotionEvent ->
+            scaleDetector.onTouchEvent(event)
+            true
+        }
         // Pin the PREVIEW surface buffer to 720p. Without this it rendered at the
         // full view size (~2316x1302 ≈ 3MP, bigger than the 1080p stream!), and
         // RootEncoder draws every camera frame to BOTH the encoder surface AND this
@@ -329,6 +371,10 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 // RootEncoder's preview for a clean re-start when the surface returns.
                 try { genericStream?.let { if (it.isOnPreview) it.stopPreview() } } catch (_: Exception) {}
                 previewStarted = false
+                // The GL filters live on the preview's GL context; when the surface is
+                // torn down (e.g. rotation, or stop) they're gone. Reset so they get
+                // re-added on the next preview start — fixes overlays vanishing.
+                filtersReady = false
             }
         })
         previewView = surface
