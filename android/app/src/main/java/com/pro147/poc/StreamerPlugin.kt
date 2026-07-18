@@ -56,6 +56,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private var previewStarted = false
     private var wantPreview = false
     private var prepared = false
+
+    // Preview surface is pinned to this (720p) to keep per-frame preview cost low so
+    // the encoder can hit 1080p60. See buildPreviewView.
+    private val PREVIEW_W = 1280
+    private val PREVIEW_H = 720
     private var preparedW = 0
     private var preparedH = 0
     private var preparedFps = 0
@@ -214,7 +219,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         try {
             stream.startPreview(surface)
             previewStarted = true
-            try { stream.getGlInterface().setPreviewResolution(w, h) } catch (_: Exception) {}
+            try { stream.getGlInterface().setPreviewResolution(PREVIEW_W, PREVIEW_H) } catch (_: Exception) {}
             reportDiag("preview.ok", mapOf("w" to w, "h" to h))
             // A zOrderOnTop SurfaceView over the WebView doesn't composite its first
             // camera frame until a re-layout forces SurfaceFlinger to update the
@@ -263,6 +268,12 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         container.setBackgroundColor(Color.BLACK)
         val surface = SurfaceView(context)
         surface.setZOrderOnTop(true)
+        // Pin the PREVIEW surface buffer to 720p. Without this it rendered at the
+        // full view size (~2316x1302 ≈ 3MP, bigger than the 1080p stream!), and
+        // RootEncoder draws every camera frame to BOTH the encoder surface AND this
+        // preview surface over the WebView — that per-frame cost was capping the
+        // encoder at ~44fps. 720p preview is plenty; the STREAM stays 1080p.
+        surface.holder.setFixedSize(PREVIEW_W, PREVIEW_H)
         container.addView(
             surface,
             FrameLayout.LayoutParams(
@@ -281,7 +292,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 // RootEncoder's example sets the preview resolution here so the GL
                 // interface sizes its preview framebuffer to the actual surface.
                 if (w > 0 && h > 0) {
-                    try { genericStream?.getGlInterface()?.setPreviewResolution(w, h) } catch (_: Exception) {}
+                    try { genericStream?.getGlInterface()?.setPreviewResolution(PREVIEW_W, PREVIEW_H) } catch (_: Exception) {}
                 }
                 maybeStartPreview()
             }
