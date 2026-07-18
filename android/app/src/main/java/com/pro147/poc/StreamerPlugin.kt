@@ -2,10 +2,13 @@ package com.pro147.poc
 
 import android.Manifest
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -20,6 +23,9 @@ import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
 import androidx.browser.customtabs.CustomTabsIntent
 import com.pedro.common.ConnectChecker
+import com.pedro.encoder.input.gl.render.filters.`object`.ImageObjectFilterRender
+import com.pedro.encoder.input.sources.audio.MicrophoneSource
+import com.pedro.encoder.input.sources.video.Camera2Source
 import com.pedro.encoder.utils.CodecUtil
 import com.pedro.library.generic.GenericStream
 import com.pedro.library.util.BitrateAdapter
@@ -61,6 +67,21 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     // the encoder can hit 1080p60. See buildPreviewView.
     private val PREVIEW_W = 1280
     private val PREVIEW_H = 720
+
+    // Overlays are authored by the web at this composite size (matches iOS).
+    private val OVERLAY_W = 1920f
+    private val OVERLAY_H = 1080f
+
+    // Overlay filters, z-order bottom→top: board → screen → sponsor → watermark.
+    // Added to the GL interface ONCE (when preview is live), then updated in place
+    // via setImage/setScale/setPosition so per-push cost is just a texture swap.
+    private var filtersReady = false
+    private val boardFilter = ImageObjectFilterRender()
+    private val screenFilter = ImageObjectFilterRender()
+    private val sponsorFilter = ImageObjectFilterRender()
+    private val watermarkFilter = ImageObjectFilterRender()
+
+    private var usingFrontCamera = false
     private var preparedW = 0
     private var preparedH = 0
     private var preparedFps = 0
@@ -221,6 +242,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             previewStarted = true
             try { stream.getGlInterface().setPreviewResolution(PREVIEW_W, PREVIEW_H) } catch (_: Exception) {}
             reportDiag("preview.ok", mapOf("w" to w, "h" to h))
+            ensureFilters()
             // A zOrderOnTop SurfaceView over the WebView doesn't composite its first
             // camera frame until a re-layout forces SurfaceFlinger to update the
             // layer — which is why the preview stayed grey until an interaction (the
@@ -449,24 +471,155 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     // ------------------------------------------------------------------
 
     @PluginMethod fun setLens(call: PluginCall) {
-        call.resolve(JSObject().put("lens", call.getString("lens", "wide")))
+        val lens = call.getString("lens", "wide")
+        activity.runOnUiThread {
+            try {
+                val src = genericStream?.videoSource as? Camera2Source
+                val wantFront = lens == "front"
+                if (src != null && wantFront != usingFrontCamera) {
+                    src.switchCamera()
+                    usingFrontCamera = wantFront
+                }
+            } catch (_: Exception) {}
+            // v1: front/back only; ultrawide/tele map to the default back camera.
+            call.resolve(JSObject().put("lens", if (usingFrontCamera) "front" else "wide"))
+        }
     }
+
     @PluginMethod fun setZoom(call: PluginCall) {
-        call.resolve(JSObject().put("factor", call.getFloat("factor", 1f)))
+        val factor = call.getFloat("factor", 1f)!!
+        activity.runOnUiThread {
+            try {
+                val src = genericStream?.videoSource as? Camera2Source
+                if (src != null) {
+                    val range = src.getZoomRange()
+                    src.setZoom(factor.coerceIn(range.lower, range.upper))
+                }
+            } catch (_: Exception) {}
+            call.resolve(JSObject().put("factor", factor))
+        }
     }
+
     @PluginMethod fun setMuted(call: PluginCall) {
-        call.resolve(JSObject().put("muted", call.getBoolean("muted", false)))
+        val muted = call.getBoolean("muted", false)!!
+        activity.runOnUiThread {
+            try {
+                val mic = genericStream?.audioSource as? MicrophoneSource
+                if (muted) mic?.mute() else mic?.unMute()
+            } catch (_: Exception) {}
+            call.resolve(JSObject().put("muted", muted))
+        }
     }
+
     @PluginMethod fun setFocusExposureLock(call: PluginCall) {
+        // AF/AE lock: Camera2 exposure/focus lock is a follow-up; resolve for now.
         call.resolve(JSObject().put("locked", call.getBoolean("locked", false)))
     }
-    @PluginMethod fun updateOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
-    @PluginMethod fun setOverlayLayer(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
-    @PluginMethod fun setScreen(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
-    @PluginMethod fun animateScreen(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
+
+    // --- Overlays (RootEncoder OpenGL image filters) ---------------------------
+
+    @PluginMethod fun setOverlayLayer(call: PluginCall) {
+        val slot = call.getString("slot") ?: "board"
+        val image = call.getString("image") ?: ""
+        val x = call.getFloat("x", 0f)!!
+        val y = call.getFloat("y", 0f)!!
+        activity.runOnUiThread {
+            try {
+                ensureFilters()
+                val f = slotFilter(slot)
+                if (image.isEmpty()) {
+                    f.setImage(transparentBitmap())
+                } else {
+                    val bmp = decodeImage(image)
+                    if (bmp != null) {
+                        f.setImage(bmp)
+                        f.setScale(bmp.width * 100f / OVERLAY_W, bmp.height * 100f / OVERLAY_H)
+                        f.setPosition(x * 100f / OVERLAY_W, y * 100f / OVERLAY_H)
+                    }
+                }
+                call.resolve(JSObject().put("ok", true))
+            } catch (_: Exception) {
+                call.resolve(JSObject().put("ok", false))
+            }
+        }
+    }
+
+    @PluginMethod fun setScreen(call: PluginCall) {
+        val image = call.getString("image") ?: ""
+        activity.runOnUiThread {
+            try {
+                ensureFilters()
+                if (image.isEmpty()) {
+                    screenFilter.setImage(transparentBitmap())
+                } else {
+                    val bmp = decodeImage(image)
+                    if (bmp != null) {
+                        screenFilter.setImage(bmp)
+                        screenFilter.setScale(100f, 100f)
+                        screenFilter.setPosition(0f, 0f)
+                    }
+                }
+                call.resolve(JSObject().put("ok", true))
+            } catch (_: Exception) {
+                call.resolve(JSObject().put("ok", false))
+            }
+        }
+    }
+
+    @PluginMethod fun updateOverlay(call: PluginCall) {
+        // Legacy full-frame overlay → route to the screen filter.
+        setScreen(call)
+    }
+
+    @PluginMethod fun animateScreen(call: PluginCall) {
+        // v1: no native slide; the screen shows/hides via setScreen. Resolve so the
+        // web caller doesn't error.
+        call.resolve(JSObject().put("ok", true))
+    }
+
     @PluginMethod fun setOverlay(call: PluginCall) { call.resolve() }
     @PluginMethod fun setBoardOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
     @PluginMethod fun setTopOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
+
+    /** Add the 4 overlay filters to the GL interface once, in z-order. Updates
+     *  after this just swap each filter's image. */
+    private fun ensureFilters() {
+        if (filtersReady) return
+        val stream = genericStream ?: return
+        if (!previewStarted) return
+        try {
+            val gl = stream.getGlInterface()
+            val blank = transparentBitmap()
+            for (f in listOf(boardFilter, screenFilter, sponsorFilter, watermarkFilter)) {
+                f.setImage(blank)
+                gl.addFilter(f)
+            }
+            filtersReady = true
+            reportDiag("filters.ready")
+        } catch (e: Exception) {
+            reportDiag("filters.error", mapOf("error" to (e.message ?: "?")))
+        }
+    }
+
+    private fun slotFilter(slot: String): ImageObjectFilterRender = when (slot) {
+        "board" -> boardFilter
+        "screen" -> screenFilter
+        "sponsor" -> sponsorFilter
+        "watermark" -> watermarkFilter
+        else -> boardFilter
+    }
+
+    private fun transparentBitmap(): Bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+
+    private fun decodeImage(image: String): Bitmap? {
+        return try {
+            val base64 = if (image.contains(",")) image.substringAfter(",") else image
+            val bytes = Base64.decode(base64, Base64.DEFAULT)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     // ------------------------------------------------------------------
     // OAuth (Chrome Custom Tabs) — Google login + YouTube connect
