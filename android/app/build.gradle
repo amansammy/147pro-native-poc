@@ -50,10 +50,12 @@ dependencies {
     // RootEncoder — hardware H.264 camera → RTMP(S), OpenGL preview + filters
     // (the Android equivalent of HaishinKit on iOS). Drives the native Streamer
     // plugin's 1080p60 streaming. See StreamerPlugin.kt.
-    // Pinned to 2.6.1: it compiles against compileSdk 35 (same as this project).
-    // 2.7.0+ require compileSdk 37 (preview SDK) → would force an AGP upgrade.
-    // Same GenericStream API.
-    implementation "com.github.pedroSG94.RootEncoder:library:2.6.1"
+    // Our FORK of RootEncoder 2.6.1 (github.com/amansammy/RootEncoder, branch
+    // operating-rate-2.6.1) — patches the video encoder to set KEY_PRIORITY=0
+    // (realtime) + KEY_OPERATING_RATE=max so the hardware encoder runs at full clock
+    // and can sustain 1080p60 (stock RootEncoder self-throttles → ~44fps). Still
+    // 2.6.1 base = compileSdk 35, same GenericStream API. JitPack builds the commit.
+    implementation "com.github.amansammy.RootEncoder:library:b02a08f436"
 
     // Chrome Custom Tabs — Google blocks OAuth inside a WebView on Android too, so
     // the native startOAuth runs the flow in a Custom Tab (mirrors iOS's
