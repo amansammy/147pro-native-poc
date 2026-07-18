@@ -402,6 +402,17 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 }
                 // Cap adaptive bitrate at the chosen video+audio target.
                 bitrateAdapter.setMaxBitrate(targetBitrate + 128_000)
+                // Enlarge the send buffer so bursty uplink doesn't force frame drops
+                // (the ~44fps suspect). A deeper cache trades a little latency (fine
+                // for a live stream) for holding 60fps through network jitter.
+                try {
+                    val client = stream.getStreamClient()
+                    val cur = client.getCacheSize()
+                    reportDiag("cache.default", mapOf("size" to cur))
+                    client.resizeCache(if (cur < 240) 240 else cur)
+                } catch (e: Exception) {
+                    reportDiag("cache.error", mapOf("error" to (e.message ?: "?")))
+                }
                 val fullUrl = if (url.endsWith("/")) "$url$key" else "$url/$key"
                 StreamingForegroundService.start(context)
                 stream.startStream(fullUrl)
@@ -512,6 +523,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         diagTimer = Timer()
         diagTimer?.scheduleAtFixedRate(object : TimerTask() {
             override fun run() {
+                val client = try { genericStream?.getStreamClient() } catch (_: Exception) { null }
                 reportDiag("media.tick", mapOf(
                     "fps" to actualFps,
                     "targetFps" to streamFps,
@@ -519,7 +531,13 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                     "h" to preparedH,
                     "bitRate" to targetBitrate,
                     "bytesPerSec" to lastBitrate / 8,
-                    "connected" to isLive
+                    "connected" to isLive,
+                    // Network-health metrics to confirm whether frames are being
+                    // dropped due to send-buffer congestion (the ~44fps suspect).
+                    "congestion" to (try { client?.hasCongestion() } catch (_: Exception) { null }),
+                    "cacheItems" to (try { client?.getItemsInCache() } catch (_: Exception) { null }),
+                    "cacheSize" to (try { client?.getCacheSize() } catch (_: Exception) { null }),
+                    "droppedVideo" to (try { client?.getDroppedVideoFrames() } catch (_: Exception) { null })
                 ))
             }
         }, 2000, 2000)
