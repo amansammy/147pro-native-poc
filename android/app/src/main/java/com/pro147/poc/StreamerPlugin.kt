@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.util.Size
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup
@@ -242,6 +243,7 @@ class StreamerPlugin : Plugin(), ConnectChecker {
             previewStarted = true
             try { stream.getGlInterface().setPreviewResolution(PREVIEW_W, PREVIEW_H) } catch (_: Exception) {}
             reportDiag("preview.ok", mapOf("w" to w, "h" to h))
+            logCameraCaps()
             ensureFilters()
             // A zOrderOnTop SurfaceView over the WebView doesn't composite its first
             // camera frame until a re-layout forces SurfaceFlinger to update the
@@ -424,17 +426,6 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 }
                 // Cap adaptive bitrate at the chosen video+audio target.
                 bitrateAdapter.setMaxBitrate(targetBitrate + 128_000)
-                // Enlarge the send buffer so bursty uplink doesn't force frame drops
-                // (the ~44fps suspect). A deeper cache trades a little latency (fine
-                // for a live stream) for holding 60fps through network jitter.
-                try {
-                    val client = stream.getStreamClient()
-                    val cur = client.getCacheSize()
-                    reportDiag("cache.default", mapOf("size" to cur))
-                    client.resizeCache(if (cur < 240) 240 else cur)
-                } catch (e: Exception) {
-                    reportDiag("cache.error", mapOf("error" to (e.message ?: "?")))
-                }
                 val fullUrl = if (url.endsWith("/")) "$url$key" else "$url/$key"
                 StreamingForegroundService.start(context)
                 stream.startStream(fullUrl)
@@ -572,9 +563,16 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     }
 
     @PluginMethod fun animateScreen(call: PluginCall) {
-        // v1: no native slide; the screen shows/hides via setScreen. Resolve so the
-        // web caller doesn't error.
-        call.resolve(JSObject().put("ok", true))
+        // The web's screen HIDE path calls only animateScreen("out") (no setScreen(""))
+        // — on iOS the native slide hides it. We have no slide yet, so "out" must
+        // actually clear the screen filter or it stays stuck on the preview.
+        val dir = call.getString("dir", "in")
+        activity.runOnUiThread {
+            try {
+                if (dir == "out") screenFilter.setImage(transparentBitmap())
+            } catch (_: Exception) {}
+            call.resolve(JSObject().put("ok", true))
+        }
     }
 
     @PluginMethod fun setOverlay(call: PluginCall) { call.resolve() }
@@ -610,6 +608,59 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     }
 
     private fun transparentBitmap(): Bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+
+    /** Logs the camera's real capabilities to the diag so we can see whether this
+     *  device even supports 1080p60 capture (the fps suspect) — and the actual
+     *  camera IDs for the selector. */
+    private fun logCameraCaps() {
+        try {
+            val src = genericStream?.videoSource as? Camera2Source ?: return
+            val fps1080 = try { src.getMaxSupportedFps(Size(1920, 1080)) } catch (_: Exception) { -1 }
+            val fps720 = try { src.getMaxSupportedFps(Size(1280, 720)) } catch (_: Exception) { -1 }
+            reportDiag("camera.caps", mapOf(
+                "cameras" to src.camerasAvailable().toList().toString(),
+                "current" to src.getCurrentCameraId().toString(),
+                "maxFps1080" to fps1080,
+                "maxFps720" to fps720
+            ))
+        } catch (_: Exception) {}
+    }
+
+    /** Returns the device's real cameras for the selector (id + facing). */
+    @PluginMethod fun getCameras(call: PluginCall) {
+        activity.runOnUiThread {
+            try {
+                val src = genericStream?.videoSource as? Camera2Source
+                val ids = src?.camerasAvailable()?.toList() ?: emptyList()
+                val arr = com.getcapacitor.JSArray()
+                for (id in ids) {
+                    val o = JSObject()
+                    o.put("id", id)
+                    arr.put(o)
+                }
+                val res = JSObject()
+                res.put("cameras", arr)
+                res.put("current", src?.getCurrentCameraId()?.toString() ?: "")
+                call.resolve(res)
+            } catch (e: Exception) {
+                call.reject("getCameras failed: ${e.message}")
+            }
+        }
+    }
+
+    /** Switch to a specific camera by id (from getCameras). */
+    @PluginMethod fun setCamera(call: PluginCall) {
+        val id = call.getString("id")
+        if (id == null) { call.reject("id required"); return }
+        activity.runOnUiThread {
+            try {
+                (genericStream?.videoSource as? Camera2Source)?.openCameraId(id)
+                call.resolve(JSObject().put("id", id))
+            } catch (e: Exception) {
+                call.reject("setCamera failed: ${e.message}")
+            }
+        }
+    }
 
     private fun decodeImage(image: String): Bitmap? {
         return try {
