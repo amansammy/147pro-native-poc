@@ -76,14 +76,22 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     private val OVERLAY_W = 1920f
     private val OVERLAY_H = 1080f
 
-    // Overlay filters, z-order bottom→top: board → screen → sponsor → watermark.
-    // Added to the GL interface ONCE (when preview is live), then updated in place
-    // via setImage/setScale/setPosition so per-push cost is just a texture swap.
+    // ONE overlay filter for ALL layers. The layers (board/screen/sponsor/watermark)
+    // are composited into a single bitmap on the CPU and fed as one texture — 1 GL
+    // pass + 1 shader instead of 4 (fixes the fps hit AND the shader-compile crash).
     private var filtersReady = false
-    private val boardFilter = ImageObjectFilterRender()
-    private val screenFilter = ImageObjectFilterRender()
-    private val sponsorFilter = ImageObjectFilterRender()
-    private val watermarkFilter = ImageObjectFilterRender()
+    private val overlayFilter = ImageObjectFilterRender()
+    // Latest layer bitmaps + their top-left position (authored at OVERLAY_W×OVERLAY_H).
+    private var boardBmp: Bitmap? = null; private var boardX = 0f; private var boardY = 0f
+    private var sponsorBmp: Bitmap? = null; private var sponsorX = 0f; private var sponsorY = 0f
+    private var watermarkBmp: Bitmap? = null; private var watermarkX = 0f; private var watermarkY = 0f
+    private var screenBmp: Bitmap? = null
+    // Double-buffered composite so the GL thread never reads a bitmap we're redrawing.
+    private val composites = arrayOf(
+        Bitmap.createBitmap(OVERLAY_W.toInt(), OVERLAY_H.toInt(), Bitmap.Config.ARGB_8888),
+        Bitmap.createBitmap(OVERLAY_W.toInt(), OVERLAY_H.toInt(), Bitmap.Config.ARGB_8888)
+    )
+    private var compositeIdx = 0
 
     private var usingFrontCamera = false
     private var currentZoom = 1f
@@ -371,10 +379,11 @@ class StreamerPlugin : Plugin(), ConnectChecker {
                 // RootEncoder's preview for a clean re-start when the surface returns.
                 try { genericStream?.let { if (it.isOnPreview) it.stopPreview() } } catch (_: Exception) {}
                 previewStarted = false
-                // The GL filters live on the preview's GL context; when the surface is
-                // torn down (e.g. rotation, or stop) they're gone. Reset so they get
-                // re-added on the next preview start — fixes overlays vanishing.
-                filtersReady = false
+                // NOTE: do NOT reset filtersReady here. Re-adding a filter recompiles
+                // its shader on a still-unstable GL context during rotation, which
+                // crashes ("Could not compile shader"). The single overlay filter is
+                // added once; its texture is re-fed via setImage, which re-uploads to
+                // the new context without a re-add.
             }
         })
         previewView = surface
@@ -565,17 +574,13 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         activity.runOnUiThread {
             try {
                 ensureFilters()
-                val f = slotFilter(slot)
-                if (image.isEmpty()) {
-                    f.setImage(transparentBitmap())
-                } else {
-                    val bmp = decodeImage(image)
-                    if (bmp != null) {
-                        f.setImage(bmp)
-                        f.setScale(bmp.width * 100f / OVERLAY_W, bmp.height * 100f / OVERLAY_H)
-                        f.setPosition(x * 100f / OVERLAY_W, y * 100f / OVERLAY_H)
-                    }
+                val bmp = if (image.isEmpty()) null else decodeImage(image)
+                when (slot) {
+                    "sponsor" -> { sponsorBmp = bmp; sponsorX = x; sponsorY = y }
+                    "watermark" -> { watermarkBmp = bmp; watermarkX = x; watermarkY = y }
+                    else -> { boardBmp = bmp; boardX = x; boardY = y }
                 }
+                recomposite()
                 call.resolve(JSObject().put("ok", true))
             } catch (_: Exception) {
                 call.resolve(JSObject().put("ok", false))
@@ -588,16 +593,8 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         activity.runOnUiThread {
             try {
                 ensureFilters()
-                if (image.isEmpty()) {
-                    screenFilter.setImage(transparentBitmap())
-                } else {
-                    val bmp = decodeImage(image)
-                    if (bmp != null) {
-                        screenFilter.setImage(bmp)
-                        screenFilter.setScale(100f, 100f)
-                        screenFilter.setPosition(0f, 0f)
-                    }
-                }
+                screenBmp = if (image.isEmpty()) null else decodeImage(image)
+                recomposite()
                 call.resolve(JSObject().put("ok", true))
             } catch (_: Exception) {
                 call.resolve(JSObject().put("ok", false))
@@ -606,19 +603,16 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     }
 
     @PluginMethod fun updateOverlay(call: PluginCall) {
-        // Legacy full-frame overlay → route to the screen filter.
+        // Legacy full-frame overlay → treat as the screen layer.
         setScreen(call)
     }
 
     @PluginMethod fun animateScreen(call: PluginCall) {
-        // The web's screen HIDE path calls only animateScreen("out") (no setScreen(""))
-        // — on iOS the native slide hides it. We have no slide yet, so "out" must
-        // actually clear the screen filter or it stays stuck on the preview.
+        // The web's screen HIDE path calls only animateScreen("out") (no setScreen("")).
+        // No native slide yet, so "out" clears the screen layer or it stays stuck.
         val dir = call.getString("dir", "in")
         activity.runOnUiThread {
-            try {
-                if (dir == "out") screenFilter.setImage(transparentBitmap())
-            } catch (_: Exception) {}
+            try { if (dir == "out") { screenBmp = null; recomposite() } } catch (_: Exception) {}
             call.resolve(JSObject().put("ok", true))
         }
     }
@@ -627,19 +621,17 @@ class StreamerPlugin : Plugin(), ConnectChecker {
     @PluginMethod fun setBoardOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
     @PluginMethod fun setTopOverlay(call: PluginCall) { call.resolve(JSObject().put("ok", true)) }
 
-    /** Add the 4 overlay filters to the GL interface once, in z-order. Updates
-     *  after this just swap each filter's image. */
+    /** Add the SINGLE overlay filter once. Its texture is refreshed via recomposite();
+     *  never re-added (re-adding recompiles the shader → crash on rotation). */
     private fun ensureFilters() {
         if (filtersReady) return
         val stream = genericStream ?: return
         if (!previewStarted) return
         try {
-            val gl = stream.getGlInterface()
-            val blank = transparentBitmap()
-            for (f in listOf(boardFilter, screenFilter, sponsorFilter, watermarkFilter)) {
-                f.setImage(blank)
-                gl.addFilter(f)
-            }
+            recomposite()
+            stream.getGlInterface().addFilter(overlayFilter)
+            overlayFilter.setScale(100f, 100f)
+            overlayFilter.setPosition(0f, 0f)
             filtersReady = true
             reportDiag("filters.ready")
         } catch (e: Exception) {
@@ -647,15 +639,21 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         }
     }
 
-    private fun slotFilter(slot: String): ImageObjectFilterRender = when (slot) {
-        "board" -> boardFilter
-        "screen" -> screenFilter
-        "sponsor" -> sponsorFilter
-        "watermark" -> watermarkFilter
-        else -> boardFilter
+    /** Draw all layers onto ONE bitmap (z-order: board → screen → sponsor → watermark)
+     *  and feed it to the single overlay filter. Double-buffered so the GL thread never
+     *  reads a bitmap mid-redraw. Cheap CPU blits vs 4 full-frame GL passes. */
+    private fun recomposite() {
+        compositeIdx = compositeIdx xor 1
+        val bmp = composites[compositeIdx]
+        val canvas = android.graphics.Canvas(bmp)
+        canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
+        val full = android.graphics.Rect(0, 0, OVERLAY_W.toInt(), OVERLAY_H.toInt())
+        boardBmp?.let { canvas.drawBitmap(it, boardX, boardY, null) }
+        screenBmp?.let { canvas.drawBitmap(it, null, full, null) }
+        sponsorBmp?.let { canvas.drawBitmap(it, sponsorX, sponsorY, null) }
+        watermarkBmp?.let { canvas.drawBitmap(it, watermarkX, watermarkY, null) }
+        try { overlayFilter.setImage(bmp) } catch (_: Exception) {}
     }
-
-    private fun transparentBitmap(): Bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
 
     /** Pin the display to its highest refresh-rate mode. RootEncoder's render loop
      *  is single-threaded and the preview swapBuffer is vsync-locked, so if the
