@@ -104,9 +104,13 @@ class StreamerPlugin : Plugin(), ConnectChecker {
         val s = GenericStream(context, this).apply {
             getGlInterface().autoHandleOrientation = true
         }
-        // Force the hardware H.264 encoder — a software fallback would choke on
-        // 1080p60 and cause the stutter (and heat). Must be set before prepareVideo.
-        try { s.forceCodecType(CodecUtil.CodecType.HARDWARE, CodecUtil.CodecType.HARDWARE) } catch (_: Exception) {}
+        // Force the hardware H.264 VIDEO encoder — a software fallback would choke on
+        // 1080p60 and cause the stutter (and heat). Audio (AAC) has no hardware codec,
+        // so leave it FIRST_COMPATIBLE_FOUND — forcing HARDWARE audio makes
+        // prepareAudio fail. Must be set before prepareVideo/prepareAudio.
+        try {
+            s.forceCodecType(CodecUtil.CodecType.HARDWARE, CodecUtil.CodecType.FIRST_COMPATIBLE_FOUND)
+        } catch (_: Exception) {}
         // Real encoded fps for the diag + on-screen readout.
         try { s.setFpsListener(FpsListener.Callback { fps -> actualFps = fps }) } catch (_: Exception) {}
         genericStream = s
